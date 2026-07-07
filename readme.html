@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MNIST 图像分割 — 从零实现 LeNet-5 魔改版</title>
+    <style>
+        /* 全局重置与字体 */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #f6f8fa;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            padding: 40px 20px;
+            color: #24292f;
+            line-height: 1.7;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background: #ffffff;
+            padding: 48px 56px;
+            border-radius: 16px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.06);
+        }
+
+        /* 标题层级 */
+        h1 {
+            font-size: 32px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+            border-bottom: 3px solid #0969da;
+            padding-bottom: 12px;
+            margin-bottom: 24px;
+            color: #0d1117;
+        }
+
+        h2 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-top: 40px;
+            margin-bottom: 16px;
+            padding-bottom: 6px;
+            border-bottom: 1px solid #d0d7de;
+            color: #0d1117;
+        }
+
+        h3 {
+            font-size: 20px;
+            font-weight: 600;
+            margin-top: 28px;
+            margin-bottom: 12px;
+            color: #0d1117;
+        }
+
+        h4 {
+            font-size: 17px;
+            font-weight: 600;
+            margin-top: 20px;
+            margin-bottom: 8px;
+            color: #0d1117;
+        }
+
+        p {
+            margin-bottom: 16px;
+            color: #24292f;
+        }
+
+        /* 引用 / 说明块 */
+        blockquote {
+            background: #f0f6fc;
+            border-left: 5px solid #0969da;
+            padding: 14px 22px;
+            margin: 18px 0;
+            border-radius: 0 8px 8px 0;
+            color: #1f2a3a;
+        }
+
+        blockquote p {
+            margin-bottom: 0;
+        }
+
+        /* 表格 */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0 28px 0;
+            font-size: 15px;
+            background: #ffffff;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+        }
+
+        th {
+            background: #f0f4f9;
+            font-weight: 600;
+            text-align: left;
+            padding: 12px 16px;
+            border-bottom: 2px solid #d0d7de;
+        }
+
+        td {
+            padding: 10px 16px;
+            border-bottom: 1px solid #e1e4e8;
+            vertical-align: top;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        /* 代码块 */
+        pre {
+            background: #0d1117;
+            color: #e6edf3;
+            padding: 18px 22px;
+            border-radius: 10px;
+            overflow-x: auto;
+            font-size: 14px;
+            line-height: 1.6;
+            font-family: "SF Mono", "Fira Code", "Menlo", monospace;
+            margin: 18px 0;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        code {
+            font-family: "SF Mono", "Fira Code", "Menlo", monospace;
+            font-size: 14px;
+            background: #eef2f6;
+            padding: 2px 8px;
+            border-radius: 6px;
+            color: #1f2328;
+        }
+
+        pre code {
+            background: transparent;
+            padding: 0;
+            color: inherit;
+            font-size: 14px;
+        }
+
+        /* 内联代码块，保持干净 */
+        p code,
+        li code,
+        td code {
+            background: #eef2f6;
+            padding: 2px 8px;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+
+        /* 列表 */
+        ul,
+        ol {
+            padding-left: 26px;
+            margin-bottom: 18px;
+        }
+
+        li {
+            margin-bottom: 6px;
+        }
+
+        /* 分隔线 */
+        hr {
+            border: 0;
+            height: 1px;
+            background: #d0d7de;
+            margin: 36px 0;
+        }
+
+        /* 徽标/标签 */
+        .badge {
+            display: inline-block;
+            background: #ddf4ff;
+            color: #0969da;
+            font-size: 13px;
+            font-weight: 500;
+            padding: 2px 12px;
+            border-radius: 20px;
+            margin-right: 6px;
+        }
+
+        .badge-green {
+            background: #dafbe1;
+            color: #1a7f37;
+        }
+
+        .badge-orange {
+            background: #fff1e5;
+            color: #bd5612;
+        }
+
+        .badge-gray {
+            background: #eef2f6;
+            color: #57606a;
+        }
+
+        /* 架构图保持可读 */
+        .arch-diagram {
+            background: #f6f8fa;
+            padding: 16px 20px;
+            border-radius: 10px;
+            font-family: "SF Mono", "Fira Code", monospace;
+            font-size: 14px;
+            line-height: 1.6;
+            white-space: pre;
+            overflow-x: auto;
+            margin: 16px 0;
+            border: 1px solid #e1e4e8;
+            color: #1f2328;
+        }
+
+        /* 响应式 */
+        @media (max-width: 768px) {
+            body {
+                padding: 16px 10px;
+            }
+            .container {
+                padding: 24px 18px;
+            }
+            h1 {
+                font-size: 26px;
+            }
+            h2 {
+                font-size: 20px;
+            }
+            table {
+                font-size: 13px;
+            }
+            th,
+            td {
+                padding: 8px 10px;
+            }
+            .arch-diagram {
+                font-size: 12px;
+                padding: 12px 14px;
+            }
+            pre {
+                font-size: 12px;
+                padding: 12px 14px;
+            }
+        }
+
+        /* 打印样式 */
+        @media print {
+            body {
+                background: #fff;
+                padding: 0.2in;
+            }
+            .container {
+                box-shadow: none;
+                padding: 10px;
+                border-radius: 0;
+            }
+            .badge {
+                border: 1px solid #ccc;
+            }
+        }
+
+        /* 列表中的小标题样式 */
+        .list-label {
+            font-weight: 600;
+            color: #0d1117;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+
+        <h1>MNIST 图像分割 — 从零实现 LeNet-5 魔改版</h1>
+        <p style="font-size:18px; color:#57606a; margin-top:-12px;">
+            ⚡ 不用 PyTorch，不用 TensorFlow，纯 NumPy 实现图像分割
+        </p>
+
+        <h2>📖 项目简介</h2>
+        <p>
+            本项目从零实现了一个<strong>图像分割模型</strong>，基于 LeNet-5 魔改，在 MNIST 数据集上进行<strong>前景（数字）分割</strong>。模型将输入图像中的每个像素分类为“数字”或“背景”，输出与输入同分辨率的二值掩码。
+        </p>
+        <ul>
+            <li>✅ 纯 NumPy 实现，无任何深度学习框架依赖</li>
+            <li>✅ 完整的<strong>前向传播 + 反向传播</strong>（手写梯度）</li>
+            <li>✅ 对称的 <strong>U-Net 风格</strong>架构 + 跳跃连接</li>
+            <li>✅ 支持 <strong>断点续训</strong>，随时保存和加载模型</li>
+            <li>✅ 支持 <strong>Dice Loss</strong> 和<strong>加权交叉熵</strong>切换</li>
+        </ul>
+
+        <hr />
+
+        <h2>🎯 项目背景</h2>
+        <h3>从分类到分割</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>任务</th>
+                    <th>输入</th>
+                    <th>输出</th>
+                    <th>目标</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>分类 (LeNet-5)</strong></td>
+                    <td>32×32 图片</td>
+                    <td>1 个数字 (0~9)</td>
+                    <td>识别是什么数字</td>
+                </tr>
+                <tr>
+                    <td><strong>分割 (本项目)</strong></td>
+                    <td>32×32 图片</td>
+                    <td>32×32 掩码 (0/1)</td>
+                    <td>识别每个像素是否属于数字</td>
+                </tr>
+            </tbody>
+        </table>
+        <p>
+            分割的难点在于需要<strong>像素级的空间精度</strong>，而不仅仅是全局类别判断。
+        </p>
+        <ul>
+            <li><strong>为什么不用框架？</strong> 理解深度学习“学习”的本质——梯度就是矩阵乘法；掌握反向传播的每一个细节；拥有完全透明的代码，调试有底气。</li>
+        </ul>
+
+        <hr />
+
+        <h2>🧠 模型架构</h2>
+        <h3>编码器 (Encoder) — LeNet-5 风格</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>层</th>
+                    <th>操作</th>
+                    <th>输入 → 输出</th>
+                    <th>通道变化</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr><td>Input</td><td>-</td><td>32×32</td><td>1</td></tr>
+                <tr><td>Conv1</td><td>5×5, pad=0, stride=1</td><td>32×32 → 28×28</td><td>1 → 6</td></tr>
+                <tr><td>ReLU1</td><td>-</td><td>28×28</td><td>6</td></tr>
+                <tr><td>Pool1</td><td>2×2, stride=2</td><td>28×28 → 14×14</td><td>6</td></tr>
+                <tr><td>Conv2</td><td>5×5, pad=0, stride=1</td><td>14×14 → 10×10</td><td>6 → 16</td></tr>
+                <tr><td>ReLU2</td><td>-</td><td>10×10</td><td>16</td></tr>
+                <tr><td>Pool2</td><td>2×2, stride=2</td><td>10×10 → 5×5</td><td>16</td></tr>
+                <tr><td><strong>Conv3 (瓶颈)</strong></td><td>1×1, pad=0</td><td>5×5 → 5×5</td><td><strong>16 → 16</strong></td></tr>
+            </tbody>
+        </table>
+        <p><span class="badge badge-blue">关键设计</span> 瓶颈保留 5×5 空间信息，而不是压缩到 1×1。</p>
+
+        <h3>解码器 (Decoder) — 与编码器对称 + 跳跃连接</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>层</th>
+                    <th>操作</th>
+                    <th>输入 → 输出</th>
+                    <th>跳跃连接</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr><td>Upsample1</td><td>bilinear, scale=2</td><td>5×5 → 10×10</td><td>-</td></tr>
+                <tr><td>Concat1</td><td>concat</td><td>16 + 16 → 32</td><td>← Conv2 (16×10×10)</td></tr>
+                <tr><td>Conv4</td><td>3×3, pad=1</td><td>32 → 6</td><td>-</td></tr>
+                <tr><td>ReLU4</td><td>-</td><td>10×10</td><td>-</td></tr>
+                <tr><td>Upsample2</td><td>bilinear, scale=1.4</td><td>10×10 → 14×14</td><td>-</td></tr>
+                <tr><td>Concat2</td><td>concat</td><td>6 + 6 → 12</td><td>← Pool1 (6×14×14)</td></tr>
+                <tr><td>Conv5</td><td>3×3, pad=1</td><td>12 → 6</td><td>-</td></tr>
+                <tr><td>ReLU5</td><td>-</td><td>14×14</td><td>-</td></tr>
+                <tr><td>Upsample3</td><td>bilinear, scale=2</td><td>14×14 → 28×28</td><td>-</td></tr>
+                <tr><td>Concat3</td><td>concat</td><td>6 + 6 → 12</td><td>← Conv1 (6×28×28)</td></tr>
+                <tr><td>Conv6</td><td>3×3, pad=1</td><td>12 → 1</td><td>-</td></tr>
+                <tr><td>ReLU6</td><td>-</td><td>28×28</td><td>-</td></tr>
+                <tr><td>Upsample4</td><td>bilinear, scale=32/28</td><td>28×28 → 32×32</td><td>-</td></tr>
+                <tr><td>Sigmoid</td><td>-</td><td>32×32</td><td>-</td></tr>
+            </tbody>
+        </table>
+
+        <h3>完整结构图</h3>
+        <div class="arch-diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│                         编码器                                 │
+├─────────────────────────────────────────────────────────────────┤
+│  Input:  (1, 32, 32)                                         │
+│      ↓                                                        │
+│  Conv1:  (6, 28, 28)  ─────────────────────────┐              │
+│      ↓                                          │              │
+│  Pool1:  (6, 14, 14)  ─────────────────┐       │              │
+│      ↓                                  │       │              │
+│  Conv2:  (16, 10, 10) ────────┐       │       │              │
+│      ↓                        │       │       │              │
+│  Pool2:  (16, 5, 5)          │       │       │              │
+│      ↓                        │       │       │              │
+│  Conv3:  (16, 5, 5) ← 瓶颈   │       │       │              │
+└─────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                         解码器                                 │
+├─────────────────────────────────────────────────────────────────┤
+│  瓶颈:    (16, 5, 5)                                         │
+│      ↓                                                        │
+│  Upsample1: (16, 10, 10) ←── Concat1 ────┐                   │
+│      ↓                                    │                   │
+│  Conv4:    (6, 10, 10)                    │                   │
+│      ↓                                    │                   │
+│  Upsample2: (6, 14, 14) ←── Concat2 ─┐   │                   │
+│      ↓                                │   │                   │
+│  Conv5:    (6, 14, 14)                │   │                   │
+│      ↓                                │   │                   │
+│  Upsample3: (6, 28, 28) ←── Concat3 ─┼───┼───┐               │
+│      ↓                                │   │   │               │
+│  Conv6:    (1, 28, 28)                │   │   │               │
+│      ↓                                │   │   │               │
+│  Upsample4: (1, 32, 32)               │   │   │               │
+│      ↓                                │   │   │               │
+│  Sigmoid:  (1, 32, 32) ← 输出        │   │   │               │
+└─────────────────────────────────────────────────────────────────┘
+                                        │   │   │               │
+                              Skip1 ────┘   │   │               │
+                              Skip2 ────────┘   │               │
+                              Skip3 ────────────┘               │
+        </div>
+
+        <hr />
+
+        <h2>🚀 快速开始</h2>
+        <h3>环境要求</h3>
+        <pre><code>Python 3.6+
+numpy
+matplotlib</code></pre>
+
+        <h3>安装依赖</h3>
+        <pre><code>pip install numpy matplotlib</code></pre>
+
+        <h3>数据准备</h3>
+        <p>下载 MNIST 数据并保存为 <code>mnist.pkl</code>（格式：<code>(X_train, y_train, X_val, y_val, X_test, y_test)</code>）。</p>
+
+        <h3>训练模型</h3>
+        <pre><code>python train_seg.py</code></pre>
+        <p>默认参数：数据量 1000 张，Batch size 32，Epochs 50，学习率 0.01，损失函数 加权交叉熵 (pos_weight=10.0)。</p>
+
+        <h3>断点续训</h3>
+        <pre><code>weights, (X_test, y_seg_test) = train_seg_mnist(
+    resume_from='models/seg_model_epoch_010.npz',
+    num_samples=1000,
+    epochs=50,
+    lr=0.001,
+)</code></pre>
+
+        <h3>可视化结果</h3>
+        <p>训练完成后自动显示 5 张图片的原图、真实掩码和预测掩码。</p>
+
+        <hr />
+
+        <h2>⚙️ 训练参数说明</h2>
+        <table>
+            <thead>
+                <tr><th>参数</th><th>默认值</th><th>说明</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>num_samples</code></td><td>1000</td><td>训练样本数（可改为 5000 或全量）</td></tr>
+                <tr><td><code>batch_size</code></td><td>32</td><td>批次大小</td></tr>
+                <tr><td><code>epochs</code></td><td>50</td><td>训练轮数</td></tr>
+                <tr><td><code>lr</code></td><td>0.01</td><td>学习率</td></tr>
+                <tr><td><code>save_interval</code></td><td>5</td><td>每 N 个 epoch 保存一次</td></tr>
+                <tr><td><code>resume_from</code></td><td>None</td><td>续训的模型路径</td></tr>
+                <tr><td><code>lr_decay</code></td><td>None</td><td>学习率衰减因子（如 0.95）</td></tr>
+            </tbody>
+        </table>
+
+        <h3>推荐训练配置</h3>
+        <table>
+            <thead>
+                <tr><th>场景</th><th>数据量</th><th>学习率</th><th>Epochs</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>快速测试</td><td>200</td><td>0.01</td><td>20</td></tr>
+                <tr><td>正常训练</td><td>2000</td><td>0.001</td><td>50</td></tr>
+                <tr><td>精细调优</td><td>5000</td><td>0.0005</td><td>50 (从已有模型续训)</td></tr>
+                <tr><td>全量训练</td><td>50000</td><td>0.001</td><td>30</td></tr>
+            </tbody>
+        </table>
+
+        <hr />
+
+        <h2>📁 项目结构</h2>
+        <pre><code>.
+├── funcs.py              # 基础层 (conv, relu, avgpool, linear, softmax, ...)
+├── fenge.py              # 分割专用模块 (上采样、分割网络、Dice Loss)
+├── train_seg.py          # 训练脚本
+├── models/               # 保存的模型文件
+│   ├── seg_model_best.npz       # 最佳模型
+│   ├── seg_model_epoch_xxx.npz  # 检查点模型
+│   └── ...
+└── README.md             # 本文件</code></pre>
+
+        <h3>文件说明</h3>
+        <ul>
+            <li><strong><code>funcs.py</code></strong>：所有基础层：卷积、池化、全连接、激活函数及其导数（纯 NumPy）</li>
+            <li><strong><code>fenge.py</code></strong>：分割网络：上采样、编码器、解码器、跳跃连接、Dice Loss、权重初始化</li>
+            <li><strong><code>train_seg.py</code></strong>：训练循环：数据加载、训练、验证、保存、可视化</li>
+        </ul>
+
+        <hr />
+
+        <h2>📊 训练结果</h2>
+        <h3>调参历程</h3>
+        <table>
+            <thead>
+                <tr><th>实验</th><th>数据量</th><th>损失函数</th><th>架构</th><th>最佳 IoU</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>v1</td><td>100</td><td>BCE</td><td>不对称</td><td>0.029</td></tr>
+                <tr><td>v2</td><td>500</td><td>BCE + pos_weight</td><td>不对称</td><td>0.231</td></tr>
+                <tr><td>v3</td><td>500</td><td>Dice</td><td>不对称</td><td>0.244</td></tr>
+                <tr><td>v4</td><td>500</td><td>Dice</td><td>修正 Conv7</td><td>0.244</td></tr>
+                <tr><td>v5</td><td>2000</td><td>Dice</td><td>修正 Conv7</td><td>0.3719</td></tr>
+                <tr><td>v6</td><td>2000</td><td>Dice</td><td>修正 Conv7 + 续训</td><td>0.3940</td></tr>
+                <tr><td><strong>v8</strong></td><td><strong>200</strong></td><td><strong>BCE + pos_weight</strong></td><td><strong>对称 + 跳跃连接</strong></td><td><strong>0.191 (18 epoch)</strong></td></tr>
+            </tbody>
+        </table>
+
+        <h3>当前最佳模型</h3>
+        <ul>
+            <li><strong>验证集 IoU</strong>：0.191 (200 张，18 epoch，进行中)</li>
+            <li><strong>趋势</strong>：持续上升，预计 50 epoch 可达 0.25~0.30</li>
+        </ul>
+
+        <hr />
+
+        <h2>🛠️ 损失函数</h2>
+        <h4>1. 加权交叉熵（当前使用）</h4>
+        <pre><code>loss = -mean(pos_weight * y * log(p) + (1-y) * log(1-p))</code></pre>
+        <p><span class="badge badge-blue">适用场景</span> 训练初期，防止模型预测全背景</p>
+
+        <h4>2. Dice Loss</h4>
+        <pre><code>loss = 1 - (2 * intersection + eps) / (union + eps)</code></pre>
+        <p><span class="badge badge-blue">适用场景</span> 训练后期，直接优化 IoU 指标</p>
+
+        <h3>切换方法</h3>
+        <pre><code># 在 train_seg.py 中
+# 使用加权交叉熵
+loss, cache = binary_cross_entropy(pred, batch_y, pos_weight=10.0)
+
+# 使用 Dice Loss
+loss, cache = dice_loss(pred, batch_y)</code></pre>
+
+        <hr />
+
+        <h2>🔧 模型保存与加载</h2>
+        <pre><code># 保存
+save_seg_model(weights, 'models/my_model.npz', epoch=10, loss=0.5, iou=0.3)
+
+# 加载
+weights, metadata = load_seg_model('models/my_model.npz')
+print(metadata)  # {'epoch': 10, 'loss': 0.5, 'iou': 0.3, 'timestamp': ...}
+
+# 列出所有模型
+list_saved_models('models')</code></pre>
+
+        <hr />
+
+        <h2>📈 可视化</h2>
+        <p>训练完成后自动显示：</p>
+        <pre><code>原图 (Input)    真实掩码 (Ground Truth)    预测掩码 (Prediction)
+   [灰度图]          [黑白图]                  [黑白图]
+   [灰度图]          [黑白图]                  [黑白图]
+   [灰度图]          [黑白图]                  [黑白图]</code></pre>
+        <p>预测掩码中每个像素的值在 0~1 之间，使用阈值 0.5 二值化。</p>
+
+        <hr />
+
+        <h2>💡 经验总结</h2>
+        <h4>为什么分割不能用 1×1 的瓶颈？</h4>
+        <blockquote>
+            <p>1×1×16 = 16 个数字<br />32×32 = 1024 个像素<br />16 → 1024，信息量放大 64 倍，不可能还原出精确位置</p>
+            <p style="margin-top:8px;">分割需要保留空间信息，瓶颈至少保留 5×5。</p>
+        </blockquote>
+
+        <h4>为什么需要跳跃连接？</h4>
+        <ul>
+            <li>编码器逐层压缩，丢失了细节（边缘、纹理）</li>
+            <li>跳跃连接把这些细节直接传给解码器</li>
+            <li>让模型同时拥有“全局理解”和“局部精度”</li>
+        </ul>
+
+        <h4>为什么先用加权交叉熵，再用 Dice Loss？</h4>
+        <ul>
+            <li>训练初期：交叉熵梯度稳定，防止模型“躺平”</li>
+            <li>训练后期：Dice Loss 直接优化目标指标 IoU</li>
+        </ul>
+
+        <hr />
+
+        <h2>🎯 下一步优化方向</h2>
+        <table>
+            <thead>
+                <tr><th>方向</th><th>预期 IoU 提升</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>增加数据量 (5000 张)</td><td>+0.10~0.15</td></tr>
+                <tr><td>数据增强 (平移、旋转)</td><td>+0.05~0.08</td></tr>
+                <tr><td>切换到 Dice Loss (精调)</td><td>+0.03~0.05</td></tr>
+                <tr><td>增加通道数</td><td>+0.02~0.04</td></tr>
+                <tr><td>使用 Dropout</td><td>+0.01~0.02</td></tr>
+            </tbody>
+        </table>
+
+        <h3>推荐下一步</h3>
+        <ol>
+            <li><strong>增加数据量到 5000 张</strong>（最有效）</li>
+            <li><strong>从最佳模型继续训练，学习率减半</strong></li>
+            <li><strong>切换到 Dice Loss 精调</strong></li>
+        </ol>
+
+        <hr />
+
+        <h2>🤝 贡献</h2>
+        <p>本项目是“从零写 AI”系列的一部分，目的是通过纯 NumPy 实现深度学习算法，帮助理解底层原理。</p>
+        <p>欢迎 fork、star、提 issue！</p>
+
+        <hr />
+
+        <h2>📄 License</h2>
+        <p>MIT</p>
+
+        <p style="text-align:center; margin-top:40px; color:#57606a; font-size:15px;">
+            Happy Coding! 🚀
+        </p>
+
+    </div>
+
+</body>
+</html>
