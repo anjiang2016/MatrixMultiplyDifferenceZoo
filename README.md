@@ -139,3 +139,107 @@ pip install numpy matplotlib
 ```bash
 python train_seg.py
 ```
+默认参数：
+- 数据量：1000 张
+- Batch size：32
+- Epochs：50
+- 学习率：0.01
+- 损失函数：加权交叉熵 (pos_weight=10.0)
+
+### 断点续训
+
+```python
+weights, (X_test, y_seg_test) = train_seg_mnist(
+    resume_from='models/seg_model_epoch_010.npz',
+    num_samples=1000,
+    epochs=50,
+    lr=0.001,
+)
+```
+
+
+### 可视化结果
+
+训练完成后自动显示 5 张图片的原图、真实掩码和预测掩码
+## 训练参数说明
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `num_samples` | 1000 | 训练样本数（可改为 5000 或全量） |
+| `batch_size` | 32 | 批次大小 |
+| `epochs` | 50 | 训练轮数 |
+| `lr` | 0.01 | 学习率 |
+| `save_interval` | 5 | 每 N 个 epoch 保存一次 |
+| `resume_from` | None | 续训的模型路径 |
+| `lr_decay` | None | 学习率衰减因子（如 0.95） |
+
+### 推荐训练配置
+
+| 场景 | 数据量 | 学习率 | Epochs |
+|------|--------|--------|--------|
+| 快速测试 | 200 | 0.01 | 20 |
+| 正常训练 | 2000 | 0.001 | 50 |
+| 精细调优 | 5000 | 0.0005 | 50（从已有模型续训） |
+| 全量训练 | 50000 | 0.001 | 30 |
+
+---
+
+## 项目结构
+├── funcs.py # 基础层 (conv, relu, avgpool, linear, softmax, ...)
+├── fenge.py # 分割专用模块 (上采样、分割网络、Dice Loss)
+├── train_seg.py # 训练脚本
+├── models/ # 保存的模型文件
+│ ├── seg_model_best.npz # 最佳模型
+│ ├── seg_model_epoch_xxx.npz # 检查点模型
+│ └── ...
+└── README.md # 本文件
+
+### 文件说明
+
+- **`funcs.py`**：所有基础层：卷积、池化、全连接、激活函数及其导数（纯 NumPy）
+- **`fenge.py`**：分割网络：上采样、编码器、解码器、跳跃连接、Dice Loss、权重初始化
+- **`train_seg.py`**：训练循环：数据加载、训练、验证、保存、可视化
+
+---
+
+## 训练结果
+
+### 调参历程
+
+| 实验 | 数据量 | 损失函数 | 架构 | 最佳 IoU |
+|------|--------|----------|------|----------|
+| v1 | 100 | BCE | 不对称 | 0.029 |
+| v2 | 500 | BCE + pos_weight | 不对称 | 0.231 |
+| v3 | 500 | Dice | 不对称 | 0.244 |
+| v4 | 500 | Dice | 修正 Conv7 | 0.244 |
+| v5 | 2000 | Dice | 修正 Conv7 | 0.3719 |
+| v6 | 2000 | Dice | 修正 Conv7 + 续训 | 0.3940 |
+| **v8** | **200** | **BCE + pos_weight** | **对称 + 跳跃连接** | **0.191 (18 epoch)** |
+
+### 当前最佳模型
+
+- **验证集 IoU**：0.191（200 张，18 epoch，进行中）
+- **趋势**：持续上升，预计 50 epoch 可达 0.25~0.30
+
+---
+
+## 损失函数
+
+### 1. 加权交叉熵（当前使用）
+
+> **适用场景**：训练初期，防止模型预测全背景。
+
+### 2. Dice Loss
+
+> **适用场景**：训练后期，直接优化 IoU 指标。
+
+### 切换方法
+
+在 `train_seg.py` 中：
+
+```python
+# 使用加权交叉熵
+loss, cache = binary_cross_entropy(pred, batch_y, pos_weight=10.0)
+
+# 使用 Dice Loss
+loss, cache = dice_loss(pred, batch_y)
