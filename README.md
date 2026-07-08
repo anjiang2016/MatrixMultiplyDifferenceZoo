@@ -112,7 +112,7 @@
                               Skip2 ────────┘   │               │
                               Skip3 ────────────┘               │
 
-
+```
 
 
 ## 快速开始
@@ -138,3 +138,4 @@ pip install numpy matplotlib
 
 ```bash
 python train_seg.py
+```
