@@ -185,6 +185,8 @@ weights, (X_test, y_seg_test) = train_seg_mnist(
 ---
 
 ## 项目结构
+```
+.
 ├── funcs.py # 基础层 (conv, relu, avgpool, linear, softmax, ...)
 ├── fenge.py # 分割专用模块 (上采样、分割网络、Dice Loss)
 ├── train_seg.py # 训练脚本
@@ -193,6 +195,7 @@ weights, (X_test, y_seg_test) = train_seg_mnist(
 │ ├── seg_model_epoch_xxx.npz # 检查点模型
 │ └── ...
 └── README.md # 本文件
+```
 
 ### 文件说明
 
