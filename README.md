@@ -229,10 +229,12 @@ weights, (X_test, y_seg_test) = train_seg_mnist(
 ## 损失函数
 
 ### 1. 加权交叉熵（当前使用）
+loss = -mean(pos_weight * y * log(p) + (1-y) * log(1-p))
 
 > **适用场景**：训练初期，防止模型预测全背景。
 
 ### 2. Dice Loss
+loss = 1 - (2 * intersection + eps) / (union + eps)
 
 > **适用场景**：训练后期，直接优化 IoU 指标。
 
@@ -246,3 +248,66 @@ loss, cache = binary_cross_entropy(pred, batch_y, pos_weight=10.0)
 
 # 使用 Dice Loss
 loss, cache = dice_loss(pred, batch_y)
+```
+	
+## 🔧 模型保存与加载
+
+### 保存
+```
+save_seg_model(weights, 'models/my_model.npz', epoch=10, loss=0.5, iou=0.3)
+```
+
+### 加载
+```
+weights, metadata = load_seg_model('models/my_model.npz')
+print(metadata) # {'epoch': 10, 'loss': 0.5, 'iou': 0.3, 'timestamp': ...}
+```
+### 列出所有模型
+```
+list_saved_models('models')
+```
+## 📈 可视化
+```
+训练完成后自动显示：
+原图 (Input) 真实掩码 (Ground Truth) 预测掩码 (Prediction)
+[灰度图] [黑白图] [黑白图]
+[灰度图] [黑白图] [黑白图]
+[灰度图] [黑白图] [黑白图]
+预测掩码中每个像素的值在 0~1 之间，使用阈值 0.5 二值化。
+```
+## 💡 经验总结
+为什么分割不能用 1×1 的瓶颈？
+```
+1×1×16 = 16 个数字
+32×32 = 1024 个像素
+16 → 1024，信息量放大 64 倍，不可能还原出精确位置
+分割需要保留空间信息，瓶颈至少保留 5×5。
+```
+为什么需要跳跃连接？
+-编码器逐层压缩，丢失了细节（边缘、纹理）
+-跳跃连接把这些细节直接传给解码器
+-让模型同时拥有“全局理解”和“局部精度”
+为什么先用加权交叉熵，再用 Dice Loss？
+-训练初期：交叉熵梯度稳定，防止模型“躺平”
+-训练后期：Dice Loss 直接优化目标指标 IoU
+
+🎯 下一步优化方向
+方向 预期 IoU 提升
+增加数据量 (5000 张) +0.10~0.15
+数据增强 (平移、旋转) +0.05~0.08
+切换到 Dice Loss (精调) +0.03~0.05
+增加通道数 +0.02~0.04
+使用 Dropout +0.01~0.02
+推荐下一步
+增加数据量到 5000 张（最有效）
+从最佳模型继续训练，学习率减半
+切换到 Dice Loss 精调
+
+🤝 贡献
+本项目是“从零写 AI”系列的一部分，目的是通过纯 NumPy 实现深度学习算法，帮助理解底层原理。
+欢迎 fork、star、提 issue！
+
+📄 License
+MIT
+
+Happy Coding! 🚀
