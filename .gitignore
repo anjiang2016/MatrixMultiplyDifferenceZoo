@@ -7,6 +7,7 @@
 *.dll
 models/
 data/
+data_road/
 *.npz
 *.zip
 *.tar.gz
