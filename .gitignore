@@ -1,7 +1,23 @@
-# 忽略数据集文件夹
+#t 忽略数据集文件夹
+*.so
+*.dSYM
+*.o
+*.a
+*.exe
+*.dll
+models/
 data/
+*.npz
 *.zip
 *.tar.gz
+# pyton
+__pycache__/
+*.pyc
+*.pyo
+
+#.swp
+#.swo
+#.tmp
 
 # 忽略模型权重文件
 *.pkl
@@ -9,6 +25,8 @@ data/
 *.ckpt
 *.pb
 *.onnx
+*.pth
+*.weights
 
 # 忽略大文件扩展名
 *.mp4

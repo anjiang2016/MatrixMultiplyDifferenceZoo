@@ -2,12 +2,6 @@
 train_seg.py - 分割模型训练脚本
 依赖 funcs.py（基础层）和 fenge.py（分割专用模块）
 """
-
-import numpy as np
-import pickle
-import time
-import matplotlib.pyplot as plt
-
 from funcs import (
     conv, d_conv,
     relu, d_relu,
@@ -29,6 +23,10 @@ from fenge import (
     save_seg_model,load_seg_model,list_saved_models,os,
     generate_seg_labels, compute_iou
 )
+import numpy as np
+import pickle
+import time
+import matplotlib.pyplot as plt
 
 
 # ============================================================
@@ -62,6 +60,9 @@ def load_mnist_data(pkl_path):
 
 def preprocess_mnist(X, y):
     """Resize 28x28 -> 32x32 (padding 2)"""
+    # 如果 X 是 (N, 28, 28)，则添加通道维度
+    if X.ndim == 3:
+        X = X[:, np.newaxis, :, :]  # (N, 1, 28, 28)
     N = X.shape[0]
     X_32 = np.zeros((N, 1, 32, 32), dtype=np.float32)
     X_32[:, :, 2:30, 2:30] = X
@@ -206,12 +207,12 @@ if __name__ == "__main__":
     
     weights, (X_test, y_seg_test) = train_seg_mnist(
         pkl_path=PKL_PATH,
-        num_samples=200,
+        num_samples=2000,
         batch_size=32,
-        epochs=50,
+        epochs=100,
         lr=0.01,
         verbose=True,
-        #resume_from='models/seg_model_epoch_030.npz',
+        resume_from='models/seg_model_best.npz',
 		save_interval=5,
 		save_dir='models'
     )
