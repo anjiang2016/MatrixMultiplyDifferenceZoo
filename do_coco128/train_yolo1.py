@@ -21,9 +21,7 @@ from yolo import (
     load_yolo_dataset
 )
 
-
 def train_yolo(data_dir, img_size=416, epochs=1, batch_size=2, lr=0.001):
-    """训练 YOLO 检测器（纯 NumPy）"""
     dataset, num_classes = load_yolo_dataset(data_dir, img_size)
     weights = init_yolo_weights(num_classes)
 
@@ -35,43 +33,47 @@ def train_yolo(data_dir, img_size=416, epochs=1, batch_size=2, lr=0.001):
     for epoch in range(epochs):
         indices = np.random.permutation(N)
         total_loss = 0.0
-        start_time = time.time()
+        epoch_start = time.time()
+
+        # 用于记录上次打印的时间
+        last_print_time = time.time()
 
         for batch_idx in range(num_batches):
             start = batch_idx * batch_size
             end = min(start + batch_size, N)
             batch_indices = indices[start:end]
 
+            batch_start = time.time()  # 记录单个 batch 开始时间（可选保留）
+
             batch_images = np.stack([dataset[i]['image'] for i in batch_indices], axis=0)
             batch_targets = [{'boxes': dataset[i]['boxes'], 'classes': dataset[i]['classes']}
                              for i in batch_indices]
 
-            # 前向
             pred, caches = forward_yolo(batch_images, weights)
-
-            # 损失
             loss = yolo_loss(pred, batch_targets, num_classes)
             total_loss += loss
 
-            # 反向
             dloss = d_yolo_loss(pred, batch_targets, num_classes)
             grads = backward_yolo(dloss, caches)
 
-            # 更新权重
-			# 更新权重
             for key in weights:
-                # 梯度裁剪（防止爆炸）
                 grads[key] = np.clip(grads[key], -1.0, 1.0)
                 weights[key] -= lr * grads[key]
-                # 权重裁剪（防止权重过大）
                 weights[key] = np.clip(weights[key], -5.0, 5.0)
 
-            if batch_idx % 10 == 0:
-                print(f"Epoch {epoch+1}/{epochs}, Batch {batch_idx}/{num_batches}, Loss: {loss:.4f}")
+            # 每 10 个 batch 打印一次
+            if (batch_idx + 1) % 10 == 0 or batch_idx == num_batches - 1:
+                current_time = time.time()
+                batch_time_total = current_time - last_print_time  # 从上次打印到现在的总耗时
+                last_print_time = current_time  # 重置
+
+                # 计算这 10 个 batch 的平均 Loss（可选）
+                avg_loss_batch = total_loss / (batch_idx + 1)  # 或者用当前 batch 的 loss
+                print(f"Epoch {epoch+1}/{epochs}, Batch {batch_idx+1}/{num_batches}, Loss: {loss:.4f}, Time(10 batches): {batch_time_total:.2f}s")
 
         avg_loss = total_loss / num_batches
-        elapsed = time.time() - start_time
-        print(f"Epoch {epoch+1}/{epochs}, Avg Loss: {avg_loss:.4f}, Time: {elapsed:.2f}s")
+        epoch_time = time.time() - epoch_start
+        print(f"Epoch {epoch+1}/{epochs}, Avg Loss: {avg_loss:.4f}, Epoch Time: {epoch_time:.2f}s")
         print("-" * 50)
 
     return weights, num_classes
@@ -81,7 +83,7 @@ def main():
     DATA_DIR = '/Users/zhaomingming/data_sets/coco128'
     IMG_SIZE = 416
     EPOCHS = 2       # 纯 NumPy 训练较慢，仅演示
-    BATCH_SIZE = 2
+    BATCH_SIZE = 8
     LR = 0.0001
 
     # 训练

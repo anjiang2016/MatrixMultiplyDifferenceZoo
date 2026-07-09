@@ -1,166 +1,22 @@
-# ============================================================
-# 尝试导入 C 扩展（如果已编译）
-# ============================================================
-try:
-    import convmodule
-    C_EXT_AVAILABLE = True
-    C_EXT_DCONV_AVAILABLE = hasattr(convmodule, 'd_conv_c')
-except ImportError:
-    C_EXT_AVAILABLE = False
-    C_EXT_DCONV_AVAILABLE = False
-    print("⚠️ C 扩展未找到，使用纯 NumPy 实现（速度较慢）")
 import numpy as np
 from numpy.lib.stride_tricks import as_strided
-import os
+import convmodule
+import numpy as np
 
-# ============================================================
-# 后端选择（通过环境变量 BACKEND 控制）
-# ============================================================
-# 可选值: 'numpy', 'c'
-# 默认: 'c'
-# 使用方式: BACKEND=numpy python train.py
-BACKEND = os.environ.get('BACKEND', 'numpy')
-#C_EXT_AVAILABLE = False
-print(f'BACKEND = {BACKEND}')
-# ============================================================
-# 卷积前向（自动选择 C 或 NumPy）
-# ============================================================
 def conv(x, w, b=None, stride=1, padding=0):
-    N, C, H, W = x.shape
-    C_out, _, Hk, Wk = w.shape
+    out = convmodule.conv_c(x, w, stride, padding)
+    if b is not None:
+        out += b.reshape(1, -1, 1, 1)
+    # 缓存信息仍用 Python 构建（保持与旧代码兼容）
+    x_pad = np.pad(x, ((0,0),(0,0),(padding,padding),(padding,padding)), mode='constant')
+    H_out = (x.shape[2] + 2*padding - w.shape[2]) // stride + 1
+    W_out = (x.shape[3] + 2*padding - w.shape[3]) // stride + 1
+    return out, x_pad, (H_out, W_out)
 
-    H_out = (H + 2*padding - Hk) // stride + 1
-    W_out = (W + 2*padding - Wk) // stride + 1
-
-    if C_EXT_AVAILABLE:
-        x_contig = np.ascontiguousarray(x, dtype=np.float32)
-        w_contig = np.ascontiguousarray(w, dtype=np.float32)
-        out = convmodule.conv_c(x_contig, w_contig, stride, padding)
-        if b is not None:
-            out += b.reshape(1, -1, 1, 1)
-        x_pad = np.pad(x, ((0,0), (0,0), (padding,padding), (padding,padding)), mode='constant')
-        cache = (x, w, b, stride, padding, x_pad, H_out, W_out)
-        # ✅ 返回三个值：out, cache, x_pad
-        #return out, cache, x_pad
-        return out, x_pad,(H_out,W_out)
-
-    if BACKEND == 'numpy':
-        # ---------- 纯 NumPy 实现 ----------
-        x_pad = np.pad(x, ((0,0), (0,0), (padding,padding), (padding,padding)), mode='constant')
-        shape = (N, C, H_out, W_out, Hk, Wk)
-        strides = (
-            x_pad.strides[0],
-            x_pad.strides[1],
-            x_pad.strides[2] * stride,
-            x_pad.strides[3] * stride,
-            x_pad.strides[2],
-            x_pad.strides[3]
-        )
-        cols = as_strided(x_pad, shape=shape, strides=strides)
-        cols = cols.reshape(N, C, H_out * W_out, Hk * Wk)
-        cols = cols.transpose(0, 2, 1, 3).reshape(N * H_out * W_out, C * Hk * Wk)
-        w_flat = w.reshape(C_out, C * Hk * Wk)
-        out = cols @ w_flat.T
-        out = out.reshape(N, H_out, W_out, C_out).transpose(0, 3, 1, 2)
-        if b is not None:
-            out += b.reshape(1, -1, 1, 1)
-        cache = (x, w, b, stride, padding, x_pad, H_out, W_out)
-        # ✅ 返回三个值：out, cache, x_pad
-        #return out, cache, x_pad
-        return out, x_pad,(H_out,W_out)
-
-
-# ============================================================
-# 卷积反向（自动选择 C 或 NumPy）
-# ============================================================
 def d_conv(dout, x, w, stride=1, padding=0, x_pad=None, H_out=None, W_out=None):
-    """
-    卷积反向传播（自动选择 C 扩展或纯 NumPy）
-    """
-    N, C, H, W = x.shape
-    C_out, _, Hk, Wk = w.shape
-
-    if isinstance(stride, int):
-        stride_h = stride_w = stride
-    else:
-        stride_h, stride_w = stride
-
-    if isinstance(padding, int):
-        pad_h = pad_w = padding
-    else:
-        pad_h, pad_w = padding
-
-    # 如果未传入 x_pad，则计算（C 扩展也需要）
-    if x_pad is None:
-        x_pad = np.pad(x, ((0,0), (0,0), (pad_h, pad_h), (pad_w, pad_w)), mode='constant')
-
-    # 计算 H_out, W_out（如果未传入）
-    if H_out is None or W_out is None:
-        H_out = (H + 2*pad_h - Hk) // stride_h + 1
-        W_out = (W + 2*pad_w - Wk) // stride_w + 1
-
-    # ---------- 优先使用 C 扩展 ----------
-    if C_EXT_DCONV_AVAILABLE:
-        # 确保数据是 float32 且内存连续
-        dout_contig = np.ascontiguousarray(dout, dtype=np.float32)
-        x_contig = np.ascontiguousarray(x, dtype=np.float32)
-        w_contig = np.ascontiguousarray(w, dtype=np.float32)
-        x_pad_contig = np.ascontiguousarray(x_pad, dtype=np.float32)
-
-        # 调用 C 函数（d_conv_c 签名：d_conv_c(dout, x, w, stride, padding, x_pad)）
-        dx, dw, db = convmodule.d_conv_c(
-            dout_contig, x_contig, w_contig,
-            stride, padding, x_pad_contig
-        )
-        return dx, dw, db
-    if BACKEND == 'numpy':
-        # ---------- 回退到纯 NumPy 实现 ----------
-        # （如果 C 扩展不可用，使用纯 NumPy 版本）
-        # db
-        db = dout.sum(axis=(0, 2, 3))
-
-        # dw
-        shape = (N, C, H_out, W_out, Hk, Wk)
-        strides = (
-            x_pad.strides[0],
-            x_pad.strides[1],
-            x_pad.strides[2] * stride_h,
-            x_pad.strides[3] * stride_w,
-            x_pad.strides[2],
-            x_pad.strides[3]
-        )
-        cols = as_strided(x_pad, shape=shape, strides=strides)
-        cols = cols.reshape(N, C, H_out * W_out, Hk * Wk)
-        cols = cols.transpose(0, 2, 1, 3).reshape(N * H_out * W_out, C * Hk * Wk)
-
-        dout_flat = dout.transpose(0, 2, 3, 1).reshape(N * H_out * W_out, C_out)
-        dw = dout_flat.T @ cols
-        dw = dw.reshape(C_out, C, Hk, Wk)
-
-        # dx
-        w_flat = w.reshape(C_out, C * Hk * Wk).T
-        dcols = dout_flat @ w_flat.T
-        dcols = dcols.reshape(N, H_out, W_out, C, Hk, Wk).transpose(0, 3, 1, 2, 4, 5)
-
-        dx_pad = np.zeros((N, C, H + 2*pad_h, W + 2*pad_w), dtype=dcols.dtype)
-        for h_off in range(Hk):
-            for w_off in range(Wk):
-                dcol_slice = dcols[:, :, :, :, h_off, w_off]
-                h_start = h_off
-                h_end = h_off + H_out * stride_h
-                w_start = w_off
-                w_end = w_off + W_out * stride_w
-                h_slice = slice(h_start, h_end, stride_h)
-                w_slice = slice(w_start, w_end, stride_w)
-                dx_pad[:, :, h_slice, w_slice] += dcol_slice
-
-        if pad_h > 0 or pad_w > 0:
-            dx = dx_pad[:, :, pad_h:-pad_h, pad_w:-pad_w]
-        else:
-            dx = dx_pad
-
-        return dx, dw, db
-
+    # 直接调用 C 扩展，忽略 H_out, W_out（内部计算）
+    dx, dw, db = convmodule.d_conv_c(dout, x, w, stride, padding, x_pad)
+    return dx, dw, db
 def sigmoid(x):
     """
     Sigmoid 激活函数

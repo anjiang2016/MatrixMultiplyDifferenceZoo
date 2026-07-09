@@ -1,11 +1,4 @@
 # coding: utf-8
-import numpy as np
-import pickle
-import time
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-import pdb
-
 # 导入所有层函数
 from funcs import (
     conv, d_conv,
@@ -18,6 +11,12 @@ from funcs import (
     softmax_cross_entropy, d_softmax_cross_entropy,
 	dropout,d_dropout
 )
+import numpy as np
+import pickle
+import time
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import pdb
 
 
 def load_mnist_data(pkl_path):
@@ -410,7 +409,7 @@ def visualize_predictions(X, y_true, weights, num_samples=10):
 
 if __name__ == "__main__":
     # 训练参数
-    PKL_PATH = '/Users/zhaomingming/data_sets/mnist/mnist.pkl'  # 你的 MNIST pkl 文件路径
+    PKL_PATH = './mnist.pkl'  # 你的 MNIST pkl 文件路径
     BATCH_SIZE =64
     EPOCHS = 20
     LEARNING_RATE = 0.05
