@@ -2,6 +2,7 @@
 download_mnist.py
 下载 MindSpore 版本的 MNIST，解压并转换为 pkl
 自动识别 train 和 test 文件夹下的 IDX 文件
+
 """
 
 import os
