@@ -1,7 +1,7 @@
 import pickle
 import matplotlib.pyplot as plt
 import numpy as np
-
+# 显示pkl格式的mnist数据集内的图片
 # 加载数据
 with open('/Users/zhaomingming/data_sets/mnist/mnist.pkl', 'rb') as f:
     data = pickle.load(f, encoding='latin1')
