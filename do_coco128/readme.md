@@ -51,13 +51,12 @@ python train_yolo_html1.py
 - 监控页面实时显示 Loss 曲线
 
 ### 📁 核心脚本说明
-```
-脚本	功能	使用方式
-train_yolo_html1.py	训练主脚本	python train_yolo_html1.py
-evaluate.py	计算 mAP 和各类别 AP	python evaluate.py
-infer_manual.py	手动浏览单张图片推理结果	python infer_manual.py
-server.py	启动 Web 监控服务器	python server.py
-```
+| 脚本 | 功能 | 使用方式 |
+|:---|:---|:---|
+| `train_yolo_html1.py` | **训练主脚本** | `python train_yolo_html1.py` |
+| `evaluate.py` | 计算 mAP 和各类别 AP | `python evaluate.py` |
+| `infer_manual.py` | 手动浏览单张图片推理结果 | `python infer_manual.py` |
+| `server.py` | 启动 Web 监控服务器 | `python server.py` |
 ### 训练监控
 
 启动 Web 服务器查看实时训练曲线：
