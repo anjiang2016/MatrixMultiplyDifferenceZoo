@@ -110,7 +110,7 @@ def forward_yolo(x, weights):
 # ============================================================
 # 3. 损失函数
 # ============================================================
-def yolo_loss(pred, targets, num_classes, grid_size=13, lambda_coord=5.0, lambda_noobj=0.5):
+def yolo_loss(pred, targets, num_classes, grid_size=13, lambda_coord=5.0, lambda_noobj=0.5,class_weights=None):
     """
     pred: (N, 5+num_classes, H, W)
     targets: list of dict {'boxes': (M,4), 'classes': (M,)}
@@ -127,6 +127,9 @@ def yolo_loss(pred, targets, num_classes, grid_size=13, lambda_coord=5.0, lambda
     pred_cls = pred[:, 5:, :, :]  # (N, num_classes, H, W)
 
     total_loss = 0.0
+    total_loss_box = 0.0          # 原始 box loss（未加权）
+    total_loss_cls = 0.0          # 原始 cls loss（未加权）
+    total_loss_obj = 0.0           # 原始 obj loss（未加权）
     for b in range(N):
         boxes = targets[b]['boxes']
         classes = targets[b]['classes']
@@ -168,14 +171,25 @@ def yolo_loss(pred, targets, num_classes, grid_size=13, lambda_coord=5.0, lambda
 
         loss_cls = 0.0
         for c in range(num_classes):
-            loss_cls += np.sum(coord_mask * (pred_cls[b, c] - cls_t[c]) ** 2)
-
-        loss = (lambda_coord * (loss_tx + loss_ty + loss_tw + loss_th) +
-                loss_obj_pos + lambda_noobj * loss_obj_noobj +
-                loss_cls)
+            loss_cls += np.sum(coord_mask * class_weights[c]*(pred_cls[b, c] - cls_t[c]) ** 2)
+        loss_box = 0.0
+        loss_box = lambda_coord*(loss_tx+loss_ty+loss_tw+loss_th)
+        loss_obj = 0.0
+        loss_obj = 20.0*loss_obj_pos + 0.05 * loss_obj_noobj
+        loss = loss_box + loss_obj + 6.0*loss_cls
+        #loss = (lambda_coord * (loss_tx + loss_ty + loss_tw + loss_th) +
+        #        loss_obj_pos + lambda_noobj * loss_obj_noobj +
+        #        loss_cls)
         total_loss += loss
-
-    return total_loss / N
+        total_loss_box +=20.0*loss_obj_pos
+        total_loss_obj +=loss_obj
+        total_loss_cls += 0.05*loss_obj_noobj
+    components = {
+        "box": total_loss_box/N,          # 原始 box loss（未加权）
+        "cls": total_loss_cls/N,          # 原始 cls loss（未加权）
+        "obj": total_loss_obj/N           # 原始 obj loss（未加权）
+    }
+    return total_loss/N , components
 
 
 # ============================================================
@@ -320,6 +334,7 @@ def decode_predictions(pred, img_size=416, conf_thresh=0.3, iou_thresh=0.5):
                 ty = pred[b, 1, i, j]
                 tw = pred[b, 2, i, j]
                 th = pred[b, 3, i, j]
+                #import pdb;pdb.set_trace()
                 obj = sigmoid(pred[b, 4, i, j])
                 cls = sigmoid(pred[b, 5:, i, j])
                 conf = obj * np.max(cls)

@@ -1,0 +1,1124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>YOLO 轻量化 · 双向传播 PVM</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #0a0a12; font-family: 'Menlo', monospace; }
+        #info-panel {
+            position: absolute; top: 16px; left: 16px;
+            background: rgba(0,0,0,0.7); backdrop-filter: blur(8px);
+            border-radius: 12px; padding: 10px 16px;
+            color: #aabcee; pointer-events: none; z-index: 10;
+            border-left: 3px solid #4facfe;
+            font-size: 13px;
+        }
+        #info-panel strong { color: #fff; }
+        #info-panel .count { color: #66ff99; }
+        #controls-ui {
+            position: absolute; bottom: 80px; right: 16px;
+            display: flex; flex-direction: column; gap: 10px; z-index: 10;
+        }
+        #controls-ui button {
+            background: rgba(0,0,0,0.6); backdrop-filter: blur(4px);
+            border: 1px solid rgba(255,255,255,0.1); color: white;
+            padding: 8px 14px; border-radius: 30px; font-size: 13px;
+            font-weight: 500; cursor: pointer; transition: all 0.2s;
+            min-width: 80px;
+        }
+        #controls-ui button:hover { background: rgba(255,255,255,0.08); }
+        #controls-ui button.primary { border-color: #4facfe; }
+        @media (max-width: 480px) {
+            #info-panel { font-size: 11px; padding: 6px 10px; }
+            #controls-ui button { padding: 6px 10px; font-size: 11px; min-width: 60px; }
+        }
+    </style>
+</head>
+<body>
+    <div id="info-panel">
+        <div><strong>🎯 YOLO 轻量化 · 双向 PVM</strong> <span style="color:#4facfe;">前向</span> · <span style="color:#ffcc44;">损失</span> · <span style="color:#ff6b81;">反向</span> · <span style="color:#ff9966;">梯度</span></div>
+        <div style="font-size:12px; margin-top:4px;">体素总数: <span class="count" id="voxel-count">0</span></div>
+        <div style="font-size:11px; margin-top:4px; color:#6688aa;">橙色 = 梯度更新量 (dW/db)</div>
+    </div>
+    <div id="controls-ui">
+        <button id="play-btn" class="primary">⏸ 暂停</button>
+        <button id="reset-btn">⟳ 重置</button>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script>
+        // ============================================================
+        //  数据定义：YOLO 轻量化模型 (num_classes=80)
+        // ============================================================
+        const inputLayer = { phase: 'forward', name: 'Input', inShape: '—', outShape: '3×416×416', params: 0, weightShape: null };
+
+        // 前向层
+        const fwdLayers = [
+            { phase: 'forward', name: 'Conv1', inShape: '3×416×416', outShape: '16×208×208', params: 16*3*3*3 + 16, weightShape: { w: [16,3,3,3] }, isConv: true },
+            { phase: 'forward', name: 'ReLU1', inShape: '16×208×208', outShape: '16×208×208', params: 0, weightShape: null, isActivation: true, actType: 'relu' },
+            { phase: 'forward', name: 'Conv2', inShape: '16×208×208', outShape: '32×104×104', params: 32*16*3*3 + 32, weightShape: { w: [32,16,3,3] }, isConv: true },
+            { phase: 'forward', name: 'ReLU2', inShape: '32×104×104', outShape: '32×104×104', params: 0, weightShape: null, isActivation: true, actType: 'relu' },
+            { phase: 'forward', name: 'Conv3', inShape: '32×104×104', outShape: '64×52×52', params: 64*32*3*3 + 64, weightShape: { w: [64,32,3,3] }, isConv: true },
+            { phase: 'forward', name: 'ReLU3', inShape: '64×52×52', outShape: '64×52×52', params: 0, weightShape: null, isActivation: true, actType: 'relu' },
+            { phase: 'forward', name: 'Conv4', inShape: '64×52×52', outShape: '128×26×26', params: 128*64*3*3 + 128, weightShape: { w: [128,64,3,3] }, isConv: true },
+            { phase: 'forward', name: 'ReLU4', inShape: '128×26×26', outShape: '128×26×26', params: 0, weightShape: null, isActivation: true, actType: 'relu' },
+            { phase: 'forward', name: 'Conv5', inShape: '128×26×26', outShape: '256×13×13', params: 256*128*3*3 + 256, weightShape: { w: [256,128,3,3] }, isConv: true },
+            { phase: 'forward', name: 'ReLU5', inShape: '256×13×13', outShape: '256×13×13', params: 0, weightShape: null, isActivation: true, actType: 'relu' },
+            { phase: 'forward', name: 'Head', inShape: '256×13×13', outShape: '85×13×13', params: 85*256*1*1 + 85, weightShape: { w: [85,256,1,1] }, isConv: true },
+        ];
+
+        // 损失层
+        const lossLayers = [
+            { phase: 'loss', name: 'yolo_loss', inShape: '85×13×13', outShape: '标量', params: 0, weightShape: null, isLoss: true },
+            { phase: 'loss', name: 'd_yolo_loss', inShape: '标量', outShape: '85×13×13', params: 0, weightShape: null, isDLoss: true },
+        ];
+
+        // 反向层 (梯度流)
+        const bwdLayers = [
+            { phase: 'backward', name: 'd_head', inShape: '85×13×13', outShape: '256×13×13', params: 0, weightShape: null, isDConv: true, forwardName: 'Head', gradShape: [85,256,1,1] },
+            { phase: 'backward', name: 'd_relu5', inShape: '256×13×13', outShape: '256×13×13', params: 0, weightShape: null, isDActivation: true, actType: 'relu', gradShape: null },
+            { phase: 'backward', name: 'd_conv5', inShape: '256×13×13', outShape: '128×26×26', params: 0, weightShape: null, isDConv: true, forwardName: 'Conv5', gradShape: [256,128,3,3] },
+            { phase: 'backward', name: 'd_relu4', inShape: '128×26×26', outShape: '128×26×26', params: 0, weightShape: null, isDActivation: true, actType: 'relu', gradShape: null },
+            { phase: 'backward', name: 'd_conv4', inShape: '128×26×26', outShape: '64×52×52', params: 0, weightShape: null, isDConv: true, forwardName: 'Conv4', gradShape: [128,64,3,3] },
+            { phase: 'backward', name: 'd_relu3', inShape: '64×52×52', outShape: '64×52×52', params: 0, weightShape: null, isDActivation: true, actType: 'relu', gradShape: null },
+            { phase: 'backward', name: 'd_conv3', inShape: '64×52×52', outShape: '32×104×104', params: 0, weightShape: null, isDConv: true, forwardName: 'Conv3', gradShape: [64,32,3,3] },
+            { phase: 'backward', name: 'd_relu2', inShape: '32×104×104', outShape: '32×104×104', params: 0, weightShape: null, isDActivation: true, actType: 'relu', gradShape: null },
+            { phase: 'backward', name: 'd_conv2', inShape: '32×104×104', outShape: '16×208×208', params: 0, weightShape: null, isDConv: true, forwardName: 'Conv2', gradShape: [32,16,3,3] },
+            { phase: 'backward', name: 'd_relu1', inShape: '16×208×208', outShape: '16×208×208', params: 0, weightShape: null, isDActivation: true, actType: 'relu', gradShape: null },
+            { phase: 'backward', name: 'd_conv1', inShape: '16×208×208', outShape: '3×416×416', params: 0, weightShape: null, isDConv: true, forwardName: 'Conv1', gradShape: [16,3,3,3] },
+        ];
+
+        // ---- 工具函数 ----
+        function parseShape(str) {
+            if (str === '标量') return { c: 1, h: 1, w: 1 };
+            if (/^\d+$/.test(str)) {
+                const n = parseInt(str, 10);
+                return { c: n, h: 1, w: 1 };
+            }
+            const parts = str.split('×').map(Number);
+            if (parts.length === 3) return { c: parts[0], h: parts[1], w: parts[2] };
+            if (parts.length === 2) return { c: 1, h: parts[0], w: parts[1] };
+            return { c: 1, h: 1, w: 1 };
+        }
+
+        function parseWeightShape(shape) {
+            if (!shape) return null;
+            if (shape.length === 4) {
+                return { type: 'conv', out: shape[0], in: shape[1], h: shape[2], w: shape[3] };
+            } else if (shape.length === 2) {
+                return { type: 'fc', out: shape[0], in: shape[1] };
+            }
+            return null;
+        }
+
+        // ---- 场景初始化 ----
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a12);
+
+        const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 1.2, 30);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.prepend(renderer.domElement);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.08;
+        controls.target.set(0, 0, 0);
+        controls.maxPolarAngle = Math.PI / 2.2;
+        controls.minDistance = 3;
+        controls.maxDistance = 120;
+
+        // ---- 灯光 ----
+        scene.add(new THREE.AmbientLight(0x40406b));
+        const dl = new THREE.DirectionalLight(0xffffff, 1.2);
+        dl.position.set(3, 8, 5);
+        scene.add(dl);
+        scene.add(new THREE.DirectionalLight(0x8888ff, 0.4).position.set(-3, 1, 5));
+
+        // ---- 星星 ----
+        const stars = new THREE.Points(
+            new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(
+                Array.from({length: 400}, () => (Math.random()-0.5)*120).concat(
+                Array.from({length: 400}, () => (Math.random()-0.5)*30+2),
+                Array.from({length: 400}, () => (Math.random()-0.5)*80-10)), 3)),
+            new THREE.PointsMaterial({color: 0x446688, size: 0.06, transparent: true, opacity: 0.2})
+        );
+        scene.add(stars);
+
+        // ---- 主组 ----
+        const group = new THREE.Group();
+        scene.add(group);
+
+        // ---- 颜色定义 ----
+        const fwdColor = new THREE.Color(0x4facfe);
+        const lossColor = new THREE.Color(0xffcc44);
+        const bwdColor = new THREE.Color(0xff6b81);
+        const gradColor = new THREE.Color(0xff9966);
+
+        const paramColor = new THREE.Color(0xf093fb);
+        const actColor = new THREE.Color(0xff8c00);
+        const poolColor = new THREE.Color(0x2ecc71);
+        const flattenColor = new THREE.Color(0x3498db);
+        const dropoutColor = new THREE.Color(0xe74c3c);
+
+        // ---- 体素参数 ----
+        const VOXEL_SIZE = 0.20;
+        const VOXEL_GAP = 0.04;
+        const STEP = VOXEL_SIZE + VOXEL_GAP;
+        const STEP_Z = STEP * 1.5;
+
+        const PARAM_VOXEL_SIZE = 0.18;
+        const PARAM_GAP = 0.03;
+        const PARAM_STEP = PARAM_VOXEL_SIZE + PARAM_GAP;
+        const PARAM_STEP_Z = PARAM_STEP * 1.5;
+
+        // ---- 操作块占位宽度 ----
+        const CURVE_WIDTH = 3.0;
+        const POOL_WIDTH = 1.8;
+        const OP_WIDTH = 1.8;
+        const LOSS_WIDTH = 1.8;
+
+        // ---- 存储所有体素对象用于交互 ----
+        const featureGroups = [];
+        let totalVoxels = 0;
+
+        // ---- 创建体素 ----
+        function createVoxelVolume(shape, baseColor, posX, posY, posZ, voxelSize, stepXY, stepZ, brightnessFactor) {
+            let {c, h, w} = shape;
+            const MAX = 32;
+            if (c > MAX) c = MAX;
+            if (h > MAX) h = MAX;
+            if (w > MAX) w = MAX;
+
+            const total = c * h * w;
+            if (total === 0 || total > 200000) return null;
+
+            const boxGeo = new THREE.BoxGeometry(voxelSize, voxelSize, voxelSize);
+            const mat = new THREE.MeshBasicMaterial();
+
+            const mesh = new THREE.InstancedMesh(boxGeo, mat, total);
+            const dummy = new THREE.Object3D();
+            const offsetX = -(w-1) * stepXY / 2;
+            const offsetY = -(h-1) * stepXY / 2;
+            const offsetZ = -(c-1) * stepZ / 2;
+
+            const color = new THREE.Color();
+            let idx = 0;
+            for (let ci = 0; ci < c; ci++) {
+                for (let hi = 0; hi < h; hi++) {
+                    for (let wi = 0; wi < w; wi++) {
+                        const px = offsetX + wi * stepXY;
+                        const py = offsetY + hi * stepXY;
+                        const pz = offsetZ + ci * stepZ;
+                        dummy.position.set(px, py, pz);
+                        dummy.updateMatrix();
+                        mesh.setMatrixAt(idx, dummy.matrix);
+                        const brightness = (0.7 + 0.3 * Math.random()) * (brightnessFactor || 1.0);
+                        const clamped = Math.min(brightness, 1.0);
+                        color.copy(baseColor).multiplyScalar(clamped);
+                        mesh.setColorAt(idx, color);
+                        idx++;
+                    }
+                }
+            }
+            mesh.instanceMatrix.needsUpdate = true;
+            mesh.instanceColor.needsUpdate = true;
+            mesh.position.set(posX, posY, posZ);
+            mesh.userData = { shape: {c, h, w}, total };
+            return mesh;
+        }
+
+        // ---- 宽度计算 ----
+        function getFeatureWidth(shape) {
+            let {c, h, w} = shape;
+            const MAX = 32;
+            if (c > MAX) c = MAX;
+            if (h > MAX) h = MAX;
+            if (w > MAX) w = MAX;
+            return w * STEP;
+        }
+
+        function getParamWidth(shape) {
+            if (!shape) return 0;
+            if (shape.type === 'conv') {
+                return shape.h * PARAM_STEP;
+            } else {
+                return PARAM_STEP;
+            }
+        }
+
+        // ---- 文本 Sprite ----
+        function makeTextSprite(text, fontSize, color, scaleX, scaleY, posX, posY, posZ, lineHeight = 1.4) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 1024;
+            canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, 1024, 256);
+            ctx.shadowColor = 'rgba(0,0,0,0.9)';
+            ctx.shadowBlur = 16;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.font = `bold ${fontSize}px Menlo, monospace`;
+            ctx.fillStyle = color;
+            const lines = text.split('\n');
+            const lineHeightPx = fontSize * lineHeight;
+            const totalHeight = lines.length * lineHeightPx;
+            const startY = (256 - totalHeight) / 2 + lineHeightPx / 2;
+            lines.forEach((line, i) => {
+                ctx.fillText(line, 512, startY + i * lineHeightPx);
+            });
+            const tex = new THREE.CanvasTexture(canvas);
+            const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+            const sprite = new THREE.Sprite(mat);
+            sprite.position.set(posX, posY, posZ);
+            sprite.scale.set(scaleX, scaleY, 1);
+            return sprite;
+        }
+
+        // ---- 操作图标生成函数 ----
+        function makeReluCurve(color, posX, posY, posZ, scale = 1.0) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 1024;
+            canvas.height = 1024;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, 1024, 1024);
+            ctx.strokeStyle = '#888';
+            ctx.lineWidth = 4;
+            ctx.beginPath();
+            ctx.moveTo(80, 512);
+            ctx.lineTo(944, 512);
+            ctx.moveTo(512, 80);
+            ctx.lineTo(512, 944);
+            ctx.stroke();
+            const steps = 8;
+            for (let i = 0; i < steps; i++) {
+                const alpha = 0.5 - i * 0.06;
+                ctx.beginPath();
+                ctx.strokeStyle = `rgba(255, 140, 0, ${alpha})`;
+                ctx.lineWidth = 80 - i * 6;
+                ctx.moveTo(80, 512);
+                ctx.lineTo(512, 512);
+                for (let x = 512; x <= 944; x += 2) {
+                    const y = 512 - (x - 512) * 0.8;
+                    if (y < 80) break;
+                    ctx.lineTo(x, y);
+                }
+                ctx.stroke();
+            }
+            ctx.beginPath();
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 12;
+            ctx.moveTo(80, 512);
+            ctx.lineTo(512, 512);
+            for (let x = 512; x <= 944; x += 2) {
+                const y = 512 - (x - 512) * 0.8;
+                if (y < 80) break;
+                ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+            const tex = new THREE.CanvasTexture(canvas);
+            const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+            const sprite = new THREE.Sprite(mat);
+            sprite.position.set(posX, posY, posZ);
+            sprite.scale.set(3.0 * scale, 3.0 * scale, 1);
+            return sprite;
+        }
+
+        function makePoolSprite(color, posX, posY, posZ, scale = 1.0) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 512;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, 512, 512);
+            const cx = 256, cy = 200;
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 16;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.beginPath();
+            ctx.moveTo(cx, 80);
+            ctx.lineTo(cx, 340);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(cx - 60, 300);
+            ctx.lineTo(cx, 380);
+            ctx.lineTo(cx + 60, 300);
+            ctx.closePath();
+            ctx.fillStyle = color;
+            ctx.fill();
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(cx - 80, 420);
+            ctx.lineTo(cx + 80, 420);
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 12;
+            ctx.stroke();
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 64px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'bottom';
+            ctx.fillText('Pool', cx, 500);
+            const tex = new THREE.CanvasTexture(canvas);
+            const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+            const sprite = new THREE.Sprite(mat);
+            sprite.position.set(posX, posY, posZ);
+            sprite.scale.set(1.2 * scale, 1.2 * scale, 1);
+            return sprite;
+        }
+
+        function makeFlattenSprite(color, posX, posY, posZ, scale = 1.0) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 512;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, 512, 512);
+            const cx = 256, cy = 240;
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 16;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.beginPath();
+            ctx.moveTo(100, 100);
+            ctx.lineTo(cx, 240);
+            ctx.moveTo(100, 380);
+            ctx.lineTo(cx, 240);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(cx, 240);
+            ctx.lineTo(412, 100);
+            ctx.moveTo(cx, 240);
+            ctx.lineTo(412, 380);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(412, 100);
+            ctx.lineTo(440, 120);
+            ctx.lineTo(420, 140);
+            ctx.closePath();
+            ctx.fillStyle = color;
+            ctx.fill();
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(412, 380);
+            ctx.lineTo(440, 360);
+            ctx.lineTo(420, 340);
+            ctx.closePath();
+            ctx.fillStyle = color;
+            ctx.fill();
+            ctx.stroke();
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 64px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'bottom';
+            ctx.fillText('Flatten', cx, 500);
+            const tex = new THREE.CanvasTexture(canvas);
+            const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+            const sprite = new THREE.Sprite(mat);
+            sprite.position.set(posX, posY, posZ);
+            sprite.scale.set(1.2 * scale, 1.2 * scale, 1);
+            return sprite;
+        }
+
+        function makeDropoutSprite(color, posX, posY, posZ, scale = 1.0) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 512;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, 512, 512);
+            const cx = 256, cy = 220;
+            const dots = [
+                [160, 140], [220, 120], [300, 130], [360, 150],
+                [130, 210], [190, 200], [270, 200], [340, 210], [400, 190],
+                [150, 280], [210, 280], [280, 280], [350, 280],
+                [180, 340], [250, 360], [320, 350]
+            ];
+            const keep = [true, true, false, true, false, true, true, false, true, true, false, true, true, false, true, true, false];
+            dots.forEach((pos, i) => {
+                const x = pos[0], y = pos[1];
+                const isActive = keep[i % keep.length];
+                ctx.beginPath();
+                ctx.arc(x, y, 18, 0, Math.PI * 2);
+                if (isActive) {
+                    ctx.fillStyle = color;
+                    ctx.fill();
+                    ctx.strokeStyle = '#fff';
+                    ctx.lineWidth = 3;
+                    ctx.stroke();
+                } else {
+                    ctx.strokeStyle = color;
+                    ctx.lineWidth = 4;
+                    ctx.stroke();
+                    ctx.beginPath();
+                    ctx.moveTo(x - 12, y - 12);
+                    ctx.lineTo(x + 12, y + 12);
+                    ctx.moveTo(x + 12, y - 12);
+                    ctx.lineTo(x - 12, y + 12);
+                    ctx.stroke();
+                }
+            });
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 64px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'bottom';
+            ctx.fillText('Dropout', cx, 500);
+            const tex = new THREE.CanvasTexture(canvas);
+            const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+            const sprite = new THREE.Sprite(mat);
+            sprite.position.set(posX, posY, posZ);
+            sprite.scale.set(1.2 * scale, 1.2 * scale, 1);
+            return sprite;
+        }
+
+        function makeLossSprite(color, posX, posY, posZ, scale = 1.0) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 512;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, 512, 512);
+            const cx = 256, cy = 240;
+            ctx.fillStyle = color;
+            ctx.beginPath();
+            ctx.moveTo(cx, 100);
+            ctx.quadraticCurveTo(cx - 80, 180, cx - 60, 280);
+            ctx.quadraticCurveTo(cx - 30, 350, cx, 400);
+            ctx.quadraticCurveTo(cx + 30, 350, cx + 60, 280);
+            ctx.quadraticCurveTo(cx + 80, 180, cx, 100);
+            ctx.closePath();
+            ctx.fill();
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 4;
+            ctx.stroke();
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 64px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'bottom';
+            ctx.fillText('Loss', cx, 500);
+            const tex = new THREE.CanvasTexture(canvas);
+            const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+            const sprite = new THREE.Sprite(mat);
+            sprite.position.set(posX, posY, posZ);
+            sprite.scale.set(1.2 * scale, 1.2 * scale, 1);
+            return sprite;
+        }
+
+        function makeDLossSprite(color, posX, posY, posZ, scale = 1.0) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 512;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, 512, 512);
+            const cx = 256, cy = 240;
+            ctx.fillStyle = color;
+            ctx.beginPath();
+            ctx.moveTo(cx, 100);
+            ctx.quadraticCurveTo(cx - 80, 180, cx - 60, 280);
+            ctx.quadraticCurveTo(cx - 30, 350, cx, 400);
+            ctx.quadraticCurveTo(cx + 30, 350, cx + 60, 280);
+            ctx.quadraticCurveTo(cx + 80, 180, cx, 100);
+            ctx.closePath();
+            ctx.fill();
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 12;
+            ctx.beginPath();
+            ctx.moveTo(cx - 60, 180);
+            ctx.lineTo(cx + 60, 180);
+            ctx.moveTo(cx + 40, 160);
+            ctx.lineTo(cx + 60, 180);
+            ctx.lineTo(cx + 40, 200);
+            ctx.stroke();
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 40px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'bottom';
+            ctx.fillText('dL', cx, 500);
+            const tex = new THREE.CanvasTexture(canvas);
+            const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+            const sprite = new THREE.Sprite(mat);
+            sprite.position.set(posX, posY, posZ);
+            sprite.scale.set(1.2 * scale, 1.2 * scale, 1);
+            return sprite;
+        }
+
+        function makeDOpSprite(label, color, posX, posY, posZ, scale = 1.0) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 512;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, 512, 512);
+            const r = 30;
+            const x = 60, y = 100, w = 392, h = 312;
+            ctx.beginPath();
+            ctx.moveTo(x + r, y);
+            ctx.lineTo(x + w - r, y);
+            ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+            ctx.lineTo(x + w, y + h - r);
+            ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+            ctx.lineTo(x + r, y + h);
+            ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+            ctx.lineTo(x, y + r);
+            ctx.quadraticCurveTo(x, y, x + r, y);
+            ctx.closePath();
+            ctx.fillStyle = color;
+            ctx.fill();
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 6;
+            ctx.stroke();
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 72px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(label, 256, 280);
+            const tex = new THREE.CanvasTexture(canvas);
+            const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+            const sprite = new THREE.Sprite(mat);
+            sprite.position.set(posX, posY, posZ);
+            sprite.scale.set(1.2 * scale, 1.2 * scale, 1);
+            return sprite;
+        }
+
+        // ---- 生成梯度更新量 Sprite ----
+        function makeGradSprite(label, color, posX, posY, posZ, scale = 1.0) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 512;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, 512, 512);
+            // 菱形框表示梯度
+            const cx = 256, cy = 240;
+            ctx.fillStyle = color;
+            ctx.beginPath();
+            ctx.moveTo(cx, 80);
+            ctx.lineTo(432, 240);
+            ctx.lineTo(cx, 400);
+            ctx.lineTo(80, 240);
+            ctx.closePath();
+            ctx.fill();
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 4;
+            ctx.stroke();
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 56px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(label, cx, 240);
+            const tex = new THREE.CanvasTexture(canvas);
+            const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+            const sprite = new THREE.Sprite(mat);
+            sprite.position.set(posX, posY, posZ);
+            sprite.scale.set(1.2 * scale, 1.2 * scale, 1);
+            return sprite;
+        }
+
+        // ---- 构建 PVM 块列表 ----
+        const GAP = 1.5;
+        const blocks = [];
+        let currentX = 0;
+
+        // 1. 前向部分
+        const allFwdLayers = [inputLayer, ...fwdLayers];
+        for (let i = 0; i < allFwdLayers.length; i++) {
+            const layer = allFwdLayers[i];
+            if (i === 0) {
+                const shape = parseShape(layer.outShape);
+                const width = getFeatureWidth(shape);
+                blocks.push({
+                    type: 'feature',
+                    phase: 'forward',
+                    layerName: layer.name,
+                    shape: shape,
+                    width: width,
+                    color: fwdColor,
+                    label: layer.name,
+                    paramText: layer.params > 0 ? `${layer.params} params` : '—',
+                    x: currentX + width/2,
+                });
+                currentX += width + GAP;
+            } else {
+                // 权重块
+                if (layer.weightShape) {
+                    const wShape = parseWeightShape(layer.weightShape.w);
+                    if (wShape) {
+                        const wWidth = getParamWidth(wShape);
+                        blocks.push({
+                            type: 'weight',
+                            phase: 'forward',
+                            layerName: layer.name,
+                            weightShape: wShape,
+                            width: wWidth,
+                            color: paramColor,
+                            label: layer.name + ' (w)',
+                            x: currentX + wWidth/2,
+                        });
+                        currentX += wWidth + GAP;
+                    }
+                }
+                // 操作块 (只有 ReLU)
+                if (layer.isActivation) {
+                    blocks.push({
+                        type: 'curve',
+                        phase: 'forward',
+                        layerName: layer.name,
+                        width: CURVE_WIDTH,
+                        color: actColor,
+                        label: 'ReLU',
+                        x: currentX + CURVE_WIDTH/2,
+                    });
+                    currentX += CURVE_WIDTH + GAP;
+                }
+                // 输出特征图
+                const shape = parseShape(layer.outShape);
+                const width = getFeatureWidth(shape);
+                blocks.push({
+                    type: 'feature',
+                    phase: 'forward',
+                    layerName: layer.name,
+                    shape: shape,
+                    width: width,
+                    color: fwdColor,
+                    label: layer.name,
+                    paramText: layer.params > 0 ? `${layer.params} params` : '—',
+                    x: currentX + width/2,
+                });
+                currentX += width + GAP;
+            }
+        }
+
+        // 2. 损失部分
+        for (let i = 0; i < lossLayers.length; i++) {
+            const layer = lossLayers[i];
+            const shape = parseShape(layer.outShape);
+            const width = LOSS_WIDTH;
+            const isLoss = layer.isLoss;
+            const label = isLoss ? 'Loss' : 'dL';
+            blocks.push({
+                type: isLoss ? 'loss' : 'dloss',
+                phase: 'loss',
+                layerName: layer.name,
+                shape: shape,
+                width: width,
+                color: lossColor,
+                label: label,
+                paramText: '',
+                x: currentX + width/2,
+            });
+            currentX += width + GAP;
+        }
+
+        // 3. 反向部分
+        for (let i = 0; i < bwdLayers.length; i++) {
+            const layer = bwdLayers[i];
+            // d_op 块 (这里用 d_conv 或 d_relu)
+            if (layer.isDConv) {
+                blocks.push({
+                    type: 'dop',
+                    phase: 'backward',
+                    layerName: layer.name,
+                    width: OP_WIDTH,
+                    color: bwdColor,
+                    label: 'd_conv',
+                    x: currentX + OP_WIDTH/2,
+                });
+                currentX += OP_WIDTH + GAP;
+            } else if (layer.isDActivation) {
+                blocks.push({
+                    type: 'dop',
+                    phase: 'backward',
+                    layerName: layer.name,
+                    width: OP_WIDTH,
+                    color: bwdColor,
+                    label: 'd_relu',
+                    x: currentX + OP_WIDTH/2,
+                });
+                currentX += OP_WIDTH + GAP;
+            }
+
+            // 梯度更新量块（仅对有 gradShape 的层，即卷积层）
+            if (layer.gradShape) {
+                const gShape = parseWeightShape(layer.gradShape);
+                if (gShape) {
+                    let gWidth;
+                    if (gShape.type === 'conv') {
+                        gWidth = gShape.h * PARAM_STEP;
+                    } else {
+                        gWidth = PARAM_STEP;
+                    }
+                    blocks.push({
+                        type: 'grad',
+                        phase: 'backward',
+                        layerName: layer.name + '_grad',
+                        gradShape: gShape,
+                        width: gWidth,
+                        color: gradColor,
+                        label: 'grad',
+                        x: currentX + gWidth/2,
+                    });
+                    currentX += gWidth + GAP;
+                }
+            }
+
+            // 输出特征图
+            const shape = parseShape(layer.outShape);
+            const width = getFeatureWidth(shape);
+            blocks.push({
+                type: 'feature',
+                phase: 'backward',
+                layerName: layer.name,
+                shape: shape,
+                width: width,
+                color: bwdColor,
+                label: layer.name,
+                paramText: '',
+                x: currentX + width/2,
+            });
+            currentX += width + GAP;
+        }
+
+        // ---- 总宽度和居中 ----
+        const totalWidth = currentX;
+        const offsetX = -totalWidth / 2;
+
+        // ---- 生成所有 PVM 块 ----
+        blocks.forEach((block) => {
+            const centerX = block.x + offsetX;
+            const y = 0;
+            const z = 0;
+
+            if (block.type === 'feature') {
+                const shape = block.shape;
+                const volume = createVoxelVolume(shape, block.color, centerX, y, z, VOXEL_SIZE, STEP, STEP_Z, 1.0);
+                if (volume) {
+                    group.add(volume);
+                    const count = shape.c * shape.h * shape.w;
+                    totalVoxels += count;
+                    volume.userData.layerName = block.layerName;
+                    volume.userData.inShape = `${shape.c}×${shape.h}×${shape.w}`;
+                    volume.userData.outShape = `${shape.c}×${shape.h}×${shape.w}`;
+                    volume.userData.params = 0;
+                    volume.userData.phase = block.phase;
+                    volume.userData.voxelCount = count;
+                    featureGroups.push(volume);
+
+                    const labelText = `${block.label}\n${shape.c}×${shape.h}×${shape.w}`;
+                    const labelSprite = makeTextSprite(
+                        labelText,
+                        80,
+                        '#ffffff',
+                        8.0, 1.6,
+                        centerX, y + 3.5, z
+                    );
+                    group.add(labelSprite);
+
+                    if (block.paramText) {
+                        const paramSprite = makeTextSprite(
+                            block.paramText,
+                            64,
+                            '#66ff99',
+                            6.0, 1.0,
+                            centerX, y - 4.5, z
+                        );
+                        group.add(paramSprite);
+                    }
+                }
+            } else if (block.type === 'weight') {
+                const wShape = block.weightShape;
+                if (wShape.type === 'conv') {
+                    const out = wShape.out;
+                    const inCh = wShape.in;
+                    const kh = wShape.h;
+                    const kw = wShape.w;
+                    const blockThickness = (inCh - 1) * PARAM_STEP_Z + PARAM_VOXEL_SIZE;
+                    const gap = 1.0;
+                    const centerSpacing = blockThickness + gap;
+                    const totalDepth = out;
+                    const offsetZ = -(totalDepth - 1) * centerSpacing / 2;
+                    for (let oi = 0; oi < out; oi++) {
+                        const brightnessFactor = 0.6 + 0.4 * Math.random();
+                        const blockZ = offsetZ + oi * centerSpacing;
+                        const blockShape = { c: inCh, h: kh, w: kw };
+                        const volume = createVoxelVolume(blockShape, block.color, centerX, y, blockZ, PARAM_VOXEL_SIZE, PARAM_STEP, PARAM_STEP_Z, brightnessFactor);
+                        if (volume) {
+                            group.add(volume);
+                            const count = inCh * kh * kw;
+                            totalVoxels += count;
+                            volume.userData.layerName = block.layerName + `_out${oi}`;
+                            volume.userData.inShape = `权重(out=${oi})`;
+                            volume.userData.outShape = `${inCh}×${kh}×${kw}`;
+                            volume.userData.params = 0;
+                            volume.userData.phase = block.phase;
+                            volume.userData.voxelCount = count;
+                            featureGroups.push(volume);
+                        }
+                    }
+                    const labelText = `${block.label}\n(${out}×${inCh}×${kh}×${kw})`;
+                    const labelSprite = makeTextSprite(
+                        labelText,
+                        80,
+                        '#f093fb',
+                        8.0, 1.6,
+                        centerX, y + 3.5, z
+                    );
+                    group.add(labelSprite);
+                } else { // fc
+                    const out = wShape.out;
+                    const inDim = wShape.in;
+                    const shape = { c: out, h: inDim, w: 1 };
+                    const volume = createVoxelVolume(shape, block.color, centerX, y, z, PARAM_VOXEL_SIZE, PARAM_STEP, PARAM_STEP_Z, 1.0);
+                    if (volume) {
+                        group.add(volume);
+                        const count = out * inDim;
+                        totalVoxels += count;
+                        volume.userData.layerName = block.layerName + '_weight';
+                        volume.userData.inShape = '权重';
+                        volume.userData.outShape = `${out}×${inDim}×1`;
+                        volume.userData.params = 0;
+                        volume.userData.phase = block.phase;
+                        volume.userData.voxelCount = count;
+                        featureGroups.push(volume);
+                    }
+                    const labelText = `${block.label}\n(${out}×${inDim})`;
+                    const labelSprite = makeTextSprite(
+                        labelText,
+                        80,
+                        '#f093fb',
+                        8.0, 1.6,
+                        centerX, y + 3.5, z
+                    );
+                    group.add(labelSprite);
+                }
+            } else if (block.type === 'curve') {
+                const curve = makeReluCurve('#ff8c00', centerX, y + 0.2, z, 1.0);
+                group.add(curve);
+                const labelSprite = makeTextSprite(
+                    'ReLU',
+                    80,
+                    '#ff8c00',
+                    8.0, 1.6,
+                    centerX, y + 3.5, z
+                );
+                group.add(labelSprite);
+            } else if (block.type === 'pool') {
+                // 本模型无 Pool
+            } else if (block.type === 'flatten') {
+                // 本模型无 Flatten
+            } else if (block.type === 'dropout') {
+                // 本模型无 Dropout
+            } else if (block.type === 'loss') {
+                const lossSprite = makeLossSprite('#ffcc44', centerX, y + 0.2, z, 1.0);
+                group.add(lossSprite);
+                const labelSprite = makeTextSprite(
+                    'Loss',
+                    80,
+                    '#ffcc44',
+                    8.0, 1.6,
+                    centerX, y + 3.5, z
+                );
+                group.add(labelSprite);
+            } else if (block.type === 'dloss') {
+                const dlossSprite = makeDLossSprite('#ffcc44', centerX, y + 0.2, z, 1.0);
+                group.add(dlossSprite);
+                const labelSprite = makeTextSprite(
+                    'dLoss',
+                    80,
+                    '#ffcc44',
+                    8.0, 1.6,
+                    centerX, y + 3.5, z
+                );
+                group.add(labelSprite);
+            } else if (block.type === 'dop') {
+                const dopSprite = makeDOpSprite(block.label, block.color, centerX, y + 0.2, z, 1.0);
+                group.add(dopSprite);
+                const labelSprite = makeTextSprite(
+                    block.label,
+                    80,
+                    '#ff6b81',
+                    8.0, 1.6,
+                    centerX, y + 3.5, z
+                );
+                group.add(labelSprite);
+            } else if (block.type === 'grad') {
+                const gShape = block.gradShape;
+                if (gShape.type === 'conv') {
+                    const out = gShape.out;
+                    const inCh = gShape.in;
+                    const kh = gShape.h;
+                    const kw = gShape.w;
+                    const blockThickness = (inCh - 1) * PARAM_STEP_Z + PARAM_VOXEL_SIZE;
+                    const gap = 1.0;
+                    const centerSpacing = blockThickness + gap;
+                    const totalDepth = out;
+                    const offsetZ = -(totalDepth - 1) * centerSpacing / 2;
+                    for (let oi = 0; oi < out; oi++) {
+                        const brightnessFactor = 0.6 + 0.4 * Math.random();
+                        const blockZ = offsetZ + oi * centerSpacing;
+                        const blockShape = { c: inCh, h: kh, w: kw };
+                        const volume = createVoxelVolume(blockShape, block.color, centerX, y, blockZ, PARAM_VOXEL_SIZE, PARAM_STEP, PARAM_STEP_Z, brightnessFactor);
+                        if (volume) {
+                            group.add(volume);
+                            const count = inCh * kh * kw;
+                            totalVoxels += count;
+                            volume.userData.layerName = block.layerName;
+                            volume.userData.inShape = `梯度(out=${oi})`;
+                            volume.userData.outShape = `${inCh}×${kh}×${kw}`;
+                            volume.userData.params = 0;
+                            volume.userData.phase = 'grad';
+                            volume.userData.voxelCount = count;
+                            featureGroups.push(volume);
+                        }
+                    }
+                    const labelText = `grad\n(${out}×${inCh}×${kh}×${kw})`;
+                    const labelSprite = makeTextSprite(
+                        labelText,
+                        80,
+                        '#ff9966',
+                        8.0, 1.6,
+                        centerX, y + 3.5, z
+                    );
+                    group.add(labelSprite);
+                } else { // fc
+                    const out = gShape.out;
+                    const inDim = gShape.in;
+                    const shape = { c: out, h: inDim, w: 1 };
+                    const volume = createVoxelVolume(shape, block.color, centerX, y, z, PARAM_VOXEL_SIZE, PARAM_STEP, PARAM_STEP_Z, 1.0);
+                    if (volume) {
+                        group.add(volume);
+                        const count = out * inDim;
+                        totalVoxels += count;
+                        volume.userData.layerName = block.layerName;
+                        volume.userData.inShape = '梯度';
+                        volume.userData.outShape = `${out}×${inDim}×1`;
+                        volume.userData.params = 0;
+                        volume.userData.phase = 'grad';
+                        volume.userData.voxelCount = count;
+                        featureGroups.push(volume);
+                    }
+                    const labelText = `grad\n(${out}×${inDim})`;
+                    const labelSprite = makeTextSprite(
+                        labelText,
+                        80,
+                        '#ff9966',
+                        8.0, 1.6,
+                        centerX, y + 3.5, z
+                    );
+                    group.add(labelSprite);
+                }
+                // 小标签 "梯度"
+                const gradLabel = makeTextSprite(
+                    '梯度',
+                    48,
+                    '#ff9966',
+                    2.0, 0.4,
+                    centerX, y - 0.8, z
+                );
+                group.add(gradLabel);
+            }
+        });
+
+        document.getElementById('voxel-count').textContent = totalVoxels.toLocaleString();
+
+        // ---- 交互 ----
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        let hovered = null;
+        let tooltipEl = document.getElementById('detail-tooltip');
+        if (!tooltipEl) {
+            tooltipEl = document.createElement('div');
+            tooltipEl.id = 'detail-tooltip';
+            tooltipEl.style.position = 'absolute';
+            tooltipEl.style.bottom = '100px';
+            tooltipEl.style.left = '50%';
+            tooltipEl.style.transform = 'translateX(-50%)';
+            tooltipEl.style.background = 'rgba(0,0,0,0.8)';
+            tooltipEl.style.backdropFilter = 'blur(8px)';
+            tooltipEl.style.borderRadius = '12px';
+            tooltipEl.style.padding = '8px 20px';
+            tooltipEl.style.color = '#fff';
+            tooltipEl.style.pointerEvents = 'none';
+            tooltipEl.style.zIndex = '20';
+            tooltipEl.style.opacity = '0';
+            tooltipEl.style.transition = 'opacity 0.2s';
+            tooltipEl.style.textAlign = 'center';
+            tooltipEl.style.fontSize = '14px';
+            tooltipEl.style.border = '1px solid rgba(255,255,255,0.1)';
+            tooltipEl.innerHTML = '<div class="name" id="dt-name">模块</div><div class="shape" id="dt-shape">形状</div><div class="voxel" id="dt-voxel">体素</div>';
+            document.body.appendChild(tooltipEl);
+        }
+        const dtName = document.getElementById('dt-name');
+        const dtShape = document.getElementById('dt-shape');
+        const dtVoxel = document.getElementById('dt-voxel');
+
+        renderer.domElement.addEventListener('pointermove', (e) => {
+            const rect = renderer.domElement.getBoundingClientRect();
+            mouse.x = ((e.clientX - rect.left)/rect.width)*2 - 1;
+            mouse.y = -((e.clientY - rect.top)/rect.height)*2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(featureGroups);
+            if (intersects.length > 0) {
+                const obj = intersects[0].object;
+                if (hovered !== obj) {
+                    hovered = obj;
+                    const d = obj.userData;
+                    const shape = d.shape || {c:0, h:0, w:0};
+                    dtName.textContent = d.layerName || '未知';
+                    dtShape.textContent = `形状: ${shape.c}×${shape.h}×${shape.w}`;
+                    dtVoxel.textContent = `体素: ${d.voxelCount || 0}`;
+                    tooltipEl.style.opacity = '1';
+                    renderer.domElement.style.cursor = 'pointer';
+                }
+            } else {
+                if (hovered) {
+                    hovered = null;
+                    tooltipEl.style.opacity = '0';
+                    renderer.domElement.style.cursor = 'default';
+                }
+            }
+        });
+
+        // ---- 控制 ----
+        let isPlaying = true;
+        const speed = 4.05;
+        const range = totalWidth * 0.6 + 3;
+        let posX = range;
+        group.position.x = posX;
+
+        document.getElementById('play-btn').addEventListener('click', () => {
+            isPlaying = !isPlaying;
+            document.getElementById('play-btn').textContent = isPlaying ? '⏸ 暂停' : '▶ 播放';
+        });
+        document.getElementById('reset-btn').addEventListener('click', () => {
+            posX = range;
+            group.position.x = posX;
+            camera.position.set(0,1.2,30);
+            controls.target.set(0,0,0);
+            controls.update();
+        });
+
+        function slide(delta) {
+            if (!isPlaying) return;
+            posX -= speed * delta;
+            if (posX < -range) posX = range;
+            group.position.x = posX;
+        }
+
+        window.addEventListener('resize', () => {
+            const w = window.innerWidth, h = window.innerHeight;
+            camera.aspect = w/h; camera.updateProjectionMatrix();
+            renderer.setSize(w,h);
+        });
+
+        let clock = new THREE.Clock();
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            slide(delta);
+            stars.rotation.y += delta * 0.002;
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+</html>

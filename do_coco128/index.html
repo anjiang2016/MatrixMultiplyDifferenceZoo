@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>训练监控面板</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+            background: #0d1117;
+            color: #e6edf3;
+            padding: 20px;
+            margin: 0;
+        }
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+        h1 {
+            text-align: center;
+            font-weight: 400;
+            font-size: 28px;
+            margin-bottom: 30px;
+            color: #f0f6fc;
+        }
+        .chart-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        .chart-card {
+            background: #161b22;
+            border-radius: 12px;
+            padding: 16px;
+            border: 1px solid #30363d;
+            height: 340px;
+            display: flex;
+            flex-direction: column;
+        }
+        .chart-card h3 {
+            margin: 0 0 8px 0;
+            flex-shrink: 0;
+            text-align: center;
+            font-weight: 400;
+            font-size: 15px;
+            color: #8b949e;
+        }
+        .chart-card canvas {
+            flex: 1;
+            width: 100% !important;
+            height: 100% !important;
+        }
+        .full-width {
+            grid-column: 1 / -1;
+        }
+        .status {
+            text-align: center;
+            color: #8b949e;
+            margin-top: 20px;
+            font-size: 14px;
+        }
+        @media (max-width: 768px) {
+            .chart-grid {
+                grid-template-columns: 1fr;
+            }
+            .full-width {
+                grid-column: 1;
+            }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>📊 YOLO 训练实时监控</h1>
+    <div class="chart-grid">
+        <div class="chart-card full-width">
+            <h3>总 Loss 与分量 (Box / Cls / Obj)</h3>
+            <canvas id="mergedChart"></canvas>
+        </div>
+        <div class="chart-card full-width">
+            <h3>各层权重绝对值平均值</h3>
+            <canvas id="layerWeightsChart"></canvas>
+        </div>
+        <div class="chart-card full-width">
+            <h3>各层梯度更新量绝对值平均值 (梯度 × 学习率)</h3>
+            <canvas id="layerGradsChart"></canvas>
+        </div>
+        <div class="chart-card full-width">
+            <h3>学习率</h3>
+            <canvas id="lrChart"></canvas>
+        </div>
+    </div>
+    <div class="status" id="status">⏳ 等待数据...</div>
+</div>
+
+<script>
+    // 颜色调色板
+    const colors = [
+        '#ff6b6b', '#4ecdc4', '#ffe66d', '#a29bfe', '#fd79a8',
+        '#fdcb6e', '#00b894', '#e17055', '#0984e3', '#6c5ce7',
+        '#00cec9', '#f368e0', '#ff9f43', '#54a0ff', '#5f27cd',
+        '#10ac84', '#ee5a24', '#1dd1a1', '#c44569', '#3dc1d3',
+        '#e15f41', '#c4e538', '#f6b93b', '#b33771', '#3b3b98'
+    ];
+
+    function getColor(index) {
+        return colors[index % colors.length];
+    }
+
+    // ---- 获取 URL 参数 ----
+    function getUrlParam(name) {
+        const urlParams = new URLSearchParams(window.location.search);
+        const val = urlParams.get(name);
+        return val !== null ? parseInt(val, 10) : null;
+    }
+
+    // ---- 过滤数据：从第 N 个点开始显示 ----
+    function filterData(data, startPoints) {
+        // 如果没有指定 start_points 或数据为空，返回全部
+        if (startPoints === null || startPoints <= 0 || !data.epochs || data.epochs.length === 0) {
+            return data;
+        }
+        const total = data.epochs.length;
+        // 如果起始点 >= 总点数，则没有数据可显示
+        if (startPoints >= total) {
+            return { ...data, epochs: [], losses: [], loss_components: { box: [], cls: [], obj: [] }, layer_weights: {}, layer_grads: {}, learning_rates: [], times: [] };
+        }
+        const startIdx = startPoints; // 直接使用传入的数值作为索引
+        const filtered = {
+            epochs: data.epochs.slice(startIdx),
+            losses: data.losses.slice(startIdx),
+            loss_components: {
+                box: data.loss_components?.box?.slice(startIdx) || [],
+                cls: data.loss_components?.cls?.slice(startIdx) || [],
+                obj: data.loss_components?.obj?.slice(startIdx) || []
+            },
+            layer_weights: {},
+            layer_grads: {},
+            learning_rates: data.learning_rates?.slice(startIdx) || [],
+            times: data.times?.slice(startIdx) || []
+        };
+        // 处理 layer_weights
+        if (data.layer_weights) {
+            for (const key in data.layer_weights) {
+                if (Array.isArray(data.layer_weights[key])) {
+                    filtered.layer_weights[key] = data.layer_weights[key].slice(startIdx);
+                }
+            }
+        }
+        if (data.layer_grads) {
+            for (const key in data.layer_grads) {
+                if (Array.isArray(data.layer_grads[key])) {
+                    filtered.layer_grads[key] = data.layer_grads[key].slice(startIdx);
+                }
+            }
+        }
+        return filtered;
+    }
+
+    // 图表变量
+    let mergedChart, layerWeightsChart, layerGradsChart, lrChart;
+    let startPoints = getUrlParam('start_points');  // 从 start_points 参数读取
+
+    function initMergedChart(canvasId, labels, datasets) {
+        const ctx = document.getElementById(canvasId).getContext('2d');
+        return new Chart(ctx, {
+            type: 'line',
+            data: { labels: labels, datasets: datasets },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { labels: { color: '#e6edf3' } } },
+                scales: {
+                    x: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#8b949e' } },
+                    y: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#8b949e' } }
+                }
+            }
+        });
+    }
+
+    function updateChart(chart, labels, datasets) {
+        chart.data.labels = labels;
+        chart.data.datasets = datasets;
+        chart.update();
+    }
+
+    function buildLayerDatasets(epochs, layerData) {
+        const keys = Object.keys(layerData);
+        return keys.map((key, idx) => ({
+            label: key,
+            data: layerData[key],
+            borderColor: getColor(idx),
+            borderWidth: 1.5,
+            tension: 0.3,
+            pointRadius: 0,
+            fill: false
+        }));
+    }
+
+    function fetchData() {
+        fetch('/data', { cache: 'no-store' })
+            .then(r => {
+                if (!r.ok) throw new Error('Network error');
+                return r.json();
+            })
+            .then(rawData => {
+                const statusEl = document.getElementById('status');
+                if (!rawData.epochs || rawData.epochs.length === 0) {
+                    statusEl.textContent = '⏳ 等待训练数据...';
+                    return;
+                }
+
+                const data = filterData(rawData, startPoints);
+                if (data.epochs.length === 0) {
+                    statusEl.textContent = startPoints !== null && startPoints > 0 ?
+                        `⚠️ 没有数据可显示（起始点 ${startPoints} 超出总点数 ${rawData.epochs.length}）` :
+                        '⏳ 等待训练数据...';
+                    return;
+                }
+
+                const total = rawData.epochs.length;
+                const displayed = data.epochs.length;
+                const startIdx = startPoints !== null && startPoints > 0 ? startPoints : 0;
+                statusEl.innerHTML = `✅ 显示从第 ${startIdx} 个点开始（共 ${total} 个 epoch，已显示 ${displayed} 个）`;
+
+                const epochs = data.epochs;
+
+                // ---- 1. 合并 Loss ----
+                const lossDatasets = [
+                    { label: 'Total Loss', data: data.losses, borderColor: '#ff6b6b', borderWidth: 3, tension: 0.3, pointRadius: 1 },
+                    { label: 'Box', data: data.loss_components.box, borderColor: '#4ecdc4', borderWidth: 2, tension: 0.3, pointRadius: 1 },
+                    { label: 'Cls', data: data.loss_components.cls, borderColor: '#ffe66d', borderWidth: 2, tension: 0.3, pointRadius: 1 },
+                    { label: 'Obj', data: data.loss_components.obj, borderColor: '#a29bfe', borderWidth: 2, tension: 0.3, pointRadius: 1 }
+                ];
+                if (!mergedChart) {
+                    mergedChart = initMergedChart('mergedChart', epochs, lossDatasets);
+                } else {
+                    updateChart(mergedChart, epochs, lossDatasets);
+                }
+
+                // ---- 2. 各层权重 ----
+                const weightDatasets = buildLayerDatasets(epochs, data.layer_weights);
+                if (!layerWeightsChart) {
+                    const ctx = document.getElementById('layerWeightsChart').getContext('2d');
+                    layerWeightsChart = new Chart(ctx, {
+                        type: 'line',
+                        data: { labels: epochs, datasets: weightDatasets },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: { legend: { labels: { color: '#e6edf3' } } },
+                            scales: {
+                                x: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#8b949e' } },
+                                y: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#8b949e' } }
+                            }
+                        }
+                    });
+                } else {
+                    updateChart(layerWeightsChart, epochs, weightDatasets);
+                }
+
+                // ---- 3. 各层梯度 ----
+                const gradDatasets = buildLayerDatasets(epochs, data.layer_grads);
+                if (!layerGradsChart) {
+                    const ctx = document.getElementById('layerGradsChart').getContext('2d');
+                    layerGradsChart = new Chart(ctx, {
+                        type: 'line',
+                        data: { labels: epochs, datasets: gradDatasets },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: { legend: { labels: { color: '#e6edf3' } } },
+                            scales: {
+                                x: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#8b949e' } },
+                                y: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#8b949e' } }
+                            }
+                        }
+                    });
+                } else {
+                    updateChart(layerGradsChart, epochs, gradDatasets);
+                }
+
+                // ---- 4. 学习率 ----
+                const lrDatasets = [
+                    { label: 'Learning Rate', data: data.learning_rates, borderColor: '#f9ca24', borderWidth: 2, tension: 0.3, pointRadius: 1 }
+                ];
+                if (!lrChart) {
+                    const ctx = document.getElementById('lrChart').getContext('2d');
+                    lrChart = new Chart(ctx, {
+                        type: 'line',
+                        data: { labels: epochs, datasets: lrDatasets },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: { legend: { labels: { color: '#e6edf3' } } },
+                            scales: {
+                                x: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#8b949e' } },
+                                y: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#8b949e' } }
+                            }
+                        }
+                    });
+                } else {
+                    updateChart(lrChart, epochs, lrDatasets);
+                }
+
+                setTimeout(fetchData, 2000);
+            })
+            .catch(() => {
+                document.getElementById('status').textContent = '⚠️ 连接失败，重试中...';
+                setTimeout(fetchData, 3000);
+            });
+    }
+
+    fetchData();
+</script>
+</body>
+</html>

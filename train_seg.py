@@ -203,7 +203,7 @@ def visualize_segmentation(X, y_true, weights, num_samples=5, threshold=0.5, sav
 # 主入口
 # ============================================================
 if __name__ == "__main__":
-    PKL_PATH = '/Users/zhaomingming/data_sets/mnist/mnist.pkl'
+    PKL_PATH = 'mnist.pkl'
     
     weights, (X_test, y_seg_test) = train_seg_mnist(
         pkl_path=PKL_PATH,
