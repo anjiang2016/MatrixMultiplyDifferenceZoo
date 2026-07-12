@@ -115,9 +115,9 @@ YOLO 损失 = 坐标损失 + 置信度损失 + 分类损失：
 
 - loss_box：边界框回归（MSE）
 
-- loss_obj：目标置信度（BCE）
+- loss_obj：目标置信度（MSE）
 
-- loss_cls：类别概率（BCE）
+- loss_cls：类别概率（MSE）
 
 ##### 优化器
 - Adam 优化器（纯 NumPy 实现）
