@@ -717,3 +717,61 @@ def d_dropout(dout, cache):
     # 梯度只通过训练时保留的神经元
     dx = dout * mask / keep_prob
     return dx
+# ========== 内部实现 layer_norm 和 d_layer_norm ==========
+def layer_norm(x, gamma, beta, eps=1e-5, cache=None):
+    """
+    前向：Layer Normalization
+    返回 out, cache
+    """
+    mean = x.mean(axis=-1, keepdims=True)
+    var = x.var(axis=-1, keepdims=True)
+    x_hat = (x - mean) / np.sqrt(var + eps)
+    out = gamma * x_hat + beta
+    cache = (x, mean, var, x_hat, gamma, eps)
+    return out, cache
+def d_layer_norm(dout, cache):
+    x, mean, var, x_hat, gamma, eps = cache
+    # dout 形状: (batch, ..., embed_dim)
+    # 对除最后一个维度外的所有维度求和，得到 (embed_dim,)
+    sum_axis = tuple(range(dout.ndim - 1))
+    dgamma = np.sum(dout * x_hat, axis=sum_axis, keepdims=False)
+    dbeta = np.sum(dout, axis=sum_axis, keepdims=False)
+    # dx 计算保持不变，需要保持维度
+    dx_hat = dout * gamma
+    N = x.shape[-1]
+    dx = (1.0 / N) * (1.0 / np.sqrt(var + eps)) * (
+        N * dx_hat - np.sum(dx_hat, axis=-1, keepdims=True) - x_hat * np.sum(dx_hat * x_hat, axis=-1, keepdims=True)
+    )
+    return dx, dgamma, dbeta
+# ========== 本地实现 cross_entropy 和 d_cross_entropy（因为 funcs 中的版本未解包） ==========
+def cross_entropy(logits, targets):
+    """logits: (batch, seq, vocab), targets: (batch, seq) 索引"""
+    probs, _ = softmax(logits, axis=-1)  # 解包
+    log_probs = np.log(probs + 1e-8)
+    batch, seq_len, vocab_size = logits.shape
+    indices = (np.arange(batch)[:, None], np.arange(seq_len)[None, :], targets)
+    loss = -np.mean(log_probs[indices])
+    return loss
+
+def d_cross_entropy(logits, targets):
+    """返回 dL/dlogits"""
+    probs, _ = softmax(logits, axis=-1)  # 解包
+    batch, seq_len, vocab_size = logits.shape
+    one_hot = np.zeros_like(logits)
+    one_hot[np.arange(batch)[:, None], np.arange(seq_len)[None, :], targets] = 1.0
+    return (probs - one_hot) / (batch * seq_len)
+def matmul(a, b):
+    return np.matmul(a, b)
+
+def d_matmul(dout, a, b):
+    da = np.matmul(dout, b.T)
+    db = np.matmul(a.T, dout)
+    return da, db
+def adam_update(params, m, v, grads, lr, step,beta1=0.9, beta2=0.999, eps=1e-8):
+    for key in params:
+        if key not in grads:
+            continue
+        m[key] = beta1 * m.get(key, 0) + (1 - beta1) * grads[key]
+        v[key] = beta2 * v.get(key, 0) + (1 - beta2) * (grads[key] ** 2)
+        params[key] -= lr * m[key] / (np.sqrt(v[key]) + eps)
+    return params, m, v, step + 1
