@@ -668,7 +668,17 @@ def d_relu(x, y=None):
         return (y > 0).astype(np.float32)
     else:
         return (x > 0).astype(np.float32)
+def silu(x):
+    """SiLU (Swish) 激活函数: x * sigmoid(x)"""
+    sig = 1.0 / (1.0 + np.exp(-x))
+    return x * sig
 
+def d_silu(dout, x):
+    """SiLU 导数: dout * (sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x)))"""
+    sig = 1.0 / (1.0 + np.exp(-x))
+    # 简化版导数: sig * (1 + x * (1 - sig))
+    grad = sig * (1 + x * (1 - sig))
+    return dout * grad
 def dropout(x, keep_prob=0.5, training=True):
     """
     Dropout 前向传播
@@ -744,22 +754,35 @@ def d_layer_norm(dout, cache):
     )
     return dx, dgamma, dbeta
 # ========== 本地实现 cross_entropy 和 d_cross_entropy（因为 funcs 中的版本未解包） ==========
-def cross_entropy(logits, targets):
-    """logits: (batch, seq, vocab), targets: (batch, seq) 索引"""
-    probs, _ = softmax(logits, axis=-1)  # 解包
+def cross_entropy(probs, targets):
+    """
+    纯净的交叉熵损失（不包含 softmax）
+    probs: (batch, seq, vocab) 概率分布（每行和为1）
+    targets: (batch, seq) 整数索引
+    返回：标量损失（平均）
+    """
+    batch, seq_len, vocab_size = probs.shape
+    # 防止数值不稳定
     log_probs = np.log(probs + 1e-8)
-    batch, seq_len, vocab_size = logits.shape
     indices = (np.arange(batch)[:, None], np.arange(seq_len)[None, :], targets)
     loss = -np.mean(log_probs[indices])
     return loss
 
-def d_cross_entropy(logits, targets):
-    """返回 dL/dlogits"""
-    probs, _ = softmax(logits, axis=-1)  # 解包
-    batch, seq_len, vocab_size = logits.shape
-    one_hot = np.zeros_like(logits)
+def d_cross_entropy(probs, targets):
+    """
+    返回损失对 probs 的梯度 (与 probs 同形状)
+    """
+    batch, seq_len, vocab_size = probs.shape
+    one_hot = np.zeros_like(probs)
     one_hot[np.arange(batch)[:, None], np.arange(seq_len)[None, :], targets] = 1.0
-    return (probs - one_hot) / (batch * seq_len)
+    # 梯度 = - (one_hot / probs) / (batch * seq_len)
+    # 但为了数值稳定性，通常使用 - (one_hot / (probs + eps)) / N
+    eps = 1e-8
+    grad = - (one_hot / (probs + eps)) / (batch * seq_len)
+    return grad
+
+
+
 def matmul(a, b):
     return np.matmul(a, b)
 

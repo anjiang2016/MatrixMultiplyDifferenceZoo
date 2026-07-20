@@ -50,7 +50,7 @@ def load_checkpoint(checkpoint_path='checkpoint.npz'):
 # ========== 分词器（纯函数） ==========
 def build_tokenizer(chars, special_tokens=None):
     if special_tokens is None:
-        special_tokens = ['<PAD>', '<UNK>', '<EOS>']
+        special_tokens = ['<PAD>', '<UNK>', '<EOS>', '<BOS>']
     all_tokens = special_tokens + chars
     char2idx = {c: i for i, c in enumerate(all_tokens)}
     idx2char = {i: c for i, c in enumerate(all_tokens)}
@@ -60,18 +60,20 @@ def build_tokenizer(chars, special_tokens=None):
         'vocab_size': len(all_tokens),
         'pad_id': char2idx['<PAD>'],
         'unk_id': char2idx['<UNK>'],
-        'eos_id': char2idx['<EOS>']
+        'eos_id': char2idx['<EOS>'],
+        'bos_id': char2idx['<BOS>']   # 新增
     }
 
 def encode(tokenizer, text, max_len=None):
     char2idx = tokenizer['char2idx']
     unk_id = tokenizer['unk_id']
     pad_id = tokenizer['pad_id']
-    tokens = []
+    tokens = [char2idx['<BOS>']]
     for c in text:
         tokens.append(char2idx.get(c, unk_id))
-        if max_len and len(tokens) >= max_len:
+        if max_len and len(tokens) >= max_len-1:
             break
+    tokens.append(char2idx['<EOS>'])
     if max_len is not None:
         if len(tokens) < max_len:
             tokens += [pad_id] * (max_len - len(tokens))
@@ -92,6 +94,7 @@ def decode(tokenizer, indices):
     return ''.join(chars)
 
 # ========== 数据提取 ==========
+
 def extract_functions(source_dir):
     samples = []
     py_files = glob.glob(os.path.join(source_dir, '*.py'))
@@ -103,37 +106,68 @@ def extract_functions(source_dir):
         for name, params_str, body in matches:
             if name.startswith('_'):
                 continue
-            doc_match = re.search(r'"""(.*?)"""', body, re.DOTALL)
-            doc = doc_match.group(1).strip() if doc_match else ''
-            input_text = f"def {name}({params_str}):\n    \"\"\"{doc}\"\"\""
-            output_text = f"def {name}({params_str}):\n{body.strip()}"
+            # 输入 = 函数签名（不带文档字符串）
+            input_text = f"def {name}({params_str}):"
+            # 输出 = 函数体（不含 def 行，包含文档和代码）
+            output_text = body.strip()
             samples.append((input_text, output_text))
     return samples
-
 def build_vocab(samples):
     all_chars = set()
     for inp, out in samples:
         all_chars.update(inp + out)
     return sorted(all_chars)
-
 def prepare_data(samples, tokenizer, max_len=512):
     data = []
+    bos_id = tokenizer['bos_id']
+    eos_id = tokenizer['eos_id']
     for inp, out in samples:
         full_text = inp + '\n' + out
         tokens = encode(tokenizer, full_text, max_len=max_len)
-        if len(tokens) < 2:
-            continue
-        input_ids = np.array(tokens[:-1], dtype=np.int32)
-        target_ids = np.array(tokens[1:], dtype=np.int32)
-        pad_len = max_len - len(input_ids)
-        if pad_len > 0:
-            input_ids = np.pad(input_ids, (0, pad_len), constant_values=tokenizer['pad_id'])
-            target_ids = np.pad(target_ids, (0, pad_len), constant_values=tokenizer['pad_id'])
-        else:
-            input_ids = input_ids[:max_len-1]
-            target_ids = target_ids[:max_len-1]
+        input_ids = np.array(tokens[:-1], dtype=np.int32)  # 长度 max_len
+        target_ids = np.array(tokens[1:], dtype=np.int32)  # 长度 max_len
         data.append((input_ids, target_ids))
     return data
+import os
+import glob
+
+def load_text_files(folder_path, extension='.txt', max_len=None):
+    """
+    读取文件夹下所有文本文件，返回内容列表。
+    每个文件作为一个独立的训练样本。
+    """
+    if not os.path.exists(folder_path):
+        raise FileNotFoundError(f"文件夹不存在: {folder_path}")
+    
+    files = glob.glob(os.path.join(folder_path, f'*{extension}'))
+    texts = []
+    for f in files:
+        with open(f, 'r', encoding='utf-8') as file:
+            content = file.read()
+        if max_len and len(content) > max_len:
+            content = content[:max_len]
+        if content.strip():
+            texts.append(content)
+    
+    print(f"加载了 {len(texts)} 个文本文件")
+    return texts
+def prepare_texts(texts, tokenizer, max_len=512):
+    data = []
+    bos_id = tokenizer['bos_id']
+    eos_id = tokenizer['eos_id']
+    for text in texts:
+        tokens = [bos_id] + encode(tokenizer, text, max_len=max_len-1) + [eos_id]
+        input_ids = np.array(tokens[:-1], dtype=np.int32)
+        target_ids = np.array(tokens[1:], dtype=np.int32)
+        data.append((input_ids, target_ids))
+    return data
+def build_texts_vocab(samples):
+    all_chars = set()
+    for inp in samples:
+        all_chars.update(inp)
+    return sorted(all_chars)
+
+
 # ========== 训练步骤 ==========
 def train_step(params, m,v,batch_inputs, batch_targets, step, lr):
     # 前向
@@ -147,10 +181,20 @@ def train_step(params, m,v,batch_inputs, batch_targets, step, lr):
     dlogits = d_softmax(dprobs, softmax_cache)         # 返回 dL/dlogits
     
     grads = backward_transformer(dlogits, caches, params)
+
+    # ---- 梯度打印（每 10 步打印一次） ----
+    if step % 1000 == 0:
+        print("\n--- Gradients (step {}) ---".format(step))
+        for key in grads:
+            if 'w' in key or 'b' in key:  # 只打印权重和偏置
+                mean_abs = np.abs(grads[key]).mean()
+                print(f"  {key}: mean_abs={mean_abs:.6f}, std={grads[key].std():.6f}")
+#    for key in grads:
+#        grads[key] = np.clip(grads[key], -1.0, 1.0)
     params, m,v,step = adam_update(params, m,v,grads, lr, step=step)
     return params, m,v,step, loss
 
-def train_model(params, data, batch_size=16, epochs=10, lr_max=0.001, lr_min=1e-6,checkpoint_path='checkpoint.npz'):
+def train_model(params, data, batch_size=8, epochs=2000, lr_max=0.00001, lr_min=1e-10,checkpoint_path='checkpoint.npz'):
     # 尝试加载检查点
     loaded = load_checkpoint(checkpoint_path)
     if loaded[0] is not None:
@@ -206,7 +250,8 @@ def train_model(params, data, batch_size=16, epochs=10, lr_max=0.001, lr_min=1e-
 # ========== 主程序 ==========
 def main():
     # 修改为你的 MMD 源码目录
-    mmd_source_dir = '../'  # 示例，请根据实际情况修改
+    #mmd_source_dir = './train_sample'  # 示例，请根据实际情况修改
+    mmd_source_dir = "../"  # 示例，请根据实际情况修改
     if not os.path.exists(mmd_source_dir):
         print(f"错误：目录 {mmd_source_dir} 不存在")
         return
@@ -215,9 +260,14 @@ def main():
     print(f"提取到 {len(samples)} 个函数样本")
     if not samples:
         return
-
     chars = build_vocab(samples)
     tokenizer = build_tokenizer(chars)
+    """
+    texts = load_text_files("./train_sample")
+    chars = build_texts_vocab(texts)
+    tokenizer = build_tokenizer(chars)
+    data = prepare_texts(texts, tokenizer, max_len=64)
+    """
     vocab_size = tokenizer['vocab_size']
     print(f"词汇表大小: {vocab_size}")
     # ---- 立即保存分词器（训练前） ----
@@ -227,25 +277,24 @@ def main():
              vocab_size=tokenizer['vocab_size'],
              pad_id=tokenizer['pad_id'],
              unk_id=tokenizer['unk_id'],
-             eos_id=tokenizer['eos_id'])
+             eos_id=tokenizer['eos_id'],
+             bos_id=tokenizer['bos_id'])
     print("分词器已保存到 tokenizer.npz")
-    data = prepare_data(samples, tokenizer, max_len=512)
+    data = prepare_data(samples, tokenizer, max_len=1024)
     print(f"生成 {len(data)} 个训练样本")
     if not data:
         return
 
     params = init_model_params(
         vocab_size=vocab_size,
-        embed_dim=64,
+        embed_dim=256,
         num_layers=4,
         num_heads=8,
-        max_seq_len=512,
+        max_seq_len=1024,
         dropout_rate=0.1
     )
     print("模型参数初始化完成")
-    np.savez('code_gen_params.npz', **params)
-    print("模型参数已保存到 code_gen_params.npz")
-    params = train_model(params, data, batch_size=8, epochs=60)
+    params = train_model(params, data)
 
     np.savez('code_gen_params.npz', **params)
     print("模型参数已保存到 code_gen_params.npz")

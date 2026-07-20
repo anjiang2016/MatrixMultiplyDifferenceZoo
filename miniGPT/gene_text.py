@@ -91,7 +91,7 @@ def generate_code(params, prompt, tokenizer, max_new_tokens=200, temperature=0.8
             next_token = np.random.choice(len(probs), p=probs)
         input_ids = np.concatenate([input_ids, np.array([[next_token]])], axis=1)
         generated_tokens.append(next_token)
-#        print(input_ids)
+        print(input_ids)
         zifushu+=1
         if next_token == tokenizer['eos_id']:
             print("Stopped at EOS")
@@ -109,8 +109,9 @@ def main():
     # 2. 加载模型
     params = load_model_params('best_model.npz')
     # 3. 生成代码
-    prompt = 'def download_file(url, filename):'
-    generated = generate_code(params, prompt, tokenizer, max_new_tokens=900, temperature=0.0)
+    #prompt = 'def download_file(url, filename):'
+    prompt = ''
+    generated = generate_code(params, prompt, tokenizer, max_new_tokens=63, temperature=0.0)
     print("\n生成的代码：")
     print(generated)
 

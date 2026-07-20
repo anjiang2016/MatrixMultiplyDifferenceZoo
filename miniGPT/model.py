@@ -11,6 +11,7 @@ import numpy as np
 from funcs import (
     linear, d_linear,
     relu, d_relu,
+    silu, d_silu,
     softmax, d_softmax,
     dropout, d_dropout,
     layer_norm, d_layer_norm
@@ -61,7 +62,7 @@ def forward_transformer(params, input_ids, mask=None):
     keep_prob = 1.0 - dropout_rate
 
     caches = {}
-
+    #import pdb;pdb.set_trace()
     # ---- 词嵌入 ----
     one_hot = np.zeros((batch, seq_len, vocab_size), dtype=np.float32)
     one_hot[np.arange(batch)[:, None], np.arange(seq_len)[None, :], input_ids] = 1.0
@@ -97,9 +98,11 @@ def forward_transformer(params, input_ids, mask=None):
         Q_rot, K_rot = apply_rotary(Q, K, cos_emb, sin_emb)
 
         scores = np.matmul(Q_rot, K_rot.transpose(0, 1, 3, 2)) / np.sqrt(head_dim)
-        if mask is not None:
-            scores = scores + mask * -1e9
-
+        if mask is None:
+            # 创建下三角矩阵，形状 (1, 1, seq_len, seq_len)
+            # 对于每个位置 i，只允许看到 <= i 的位置
+            mask = np.triu(np.ones((1, 1, seq_len, seq_len)), k=1) * -1e9
+        scores = scores + mask
         attn, softmax_cache = softmax(scores, axis=-1)
         attn, dropout_cache = dropout(attn, keep_prob)
 
@@ -116,7 +119,7 @@ def forward_transformer(params, input_ids, mask=None):
         x_flat = x.reshape(-1, embed_dim)
         ff_h_flat, ff_linear1_cache = linear(x_flat, layer_params['ff_w1'], layer_params['ff_b1'])
         ff_h = ff_h_flat.reshape(batch, seq_len, embed_dim*4)
-        ff_h = relu(ff_h)
+        ff_h = silu(ff_h)
         ff_h_flat = ff_h.reshape(-1, embed_dim*4)
         ff_h_flat, ff_dropout_cache = dropout(ff_h_flat, keep_prob)
         ff_out_flat, ff_linear2_cache = linear(ff_h_flat, layer_params['ff_w2'], layer_params['ff_b2'])
@@ -219,7 +222,7 @@ def backward_transformer(dlogits, caches, params):
 
         dh_flat = d_dropout(dh_flat, ff_dropout_cache)
         dh = dh_flat.reshape(batch, seq_len, embed_dim*4)
-        dh = d_relu(dh, ff_h)  # dh 三维
+        dh = d_silu(dh, ff_h)  # dh 三维
         dh_flat = dh.reshape(-1, embed_dim*4)
 
         dx_ff_flat, dw_ff1, db_ff1 = d_linear(dh_flat, ff_linear1_cache)
@@ -304,29 +307,29 @@ def init_model_params(vocab_size, embed_dim=256, num_layers=4, num_heads=8, max_
         'num_heads': num_heads,
         'vocab_size': vocab_size,
         'dropout_rate': dropout_rate,
-        'embed_weight': np.random.randn(vocab_size, embed_dim) * 0.02,
-        'output_w': np.random.randn(embed_dim, vocab_size) * 0.02,
+        'embed_weight': np.random.randn(vocab_size, embed_dim) * 0.05,
+        'output_w': np.random.randn(embed_dim, vocab_size) * 0.05,
         'output_b': np.zeros(vocab_size),
         'cos_emb': cos_emb,
         'sin_emb': sin_emb,
     }
 
     for i in range(num_layers):
-        params[f'layer_{i}_w_q'] = np.random.randn(embed_dim, embed_dim) * 0.02
+        params[f'layer_{i}_w_q'] = np.random.randn(embed_dim, embed_dim) * 0.05
         params[f'layer_{i}_b_q'] = np.zeros(embed_dim)
-        params[f'layer_{i}_w_k'] = np.random.randn(embed_dim, embed_dim) * 0.02
+        params[f'layer_{i}_w_k'] = np.random.randn(embed_dim, embed_dim) * 0.05
         params[f'layer_{i}_b_k'] = np.zeros(embed_dim)
-        params[f'layer_{i}_w_v'] = np.random.randn(embed_dim, embed_dim) * 0.02
+        params[f'layer_{i}_w_v'] = np.random.randn(embed_dim, embed_dim) * 0.05
         params[f'layer_{i}_b_v'] = np.zeros(embed_dim)
-        params[f'layer_{i}_w_o'] = np.random.randn(embed_dim, embed_dim) * 0.02
+        params[f'layer_{i}_w_o'] = np.random.randn(embed_dim, embed_dim) * 0.05
         params[f'layer_{i}_b_o'] = np.zeros(embed_dim)
         params[f'layer_{i}_ln1_gamma'] = np.ones(embed_dim)
         params[f'layer_{i}_ln1_beta'] = np.zeros(embed_dim)
         params[f'layer_{i}_ln2_gamma'] = np.ones(embed_dim)
         params[f'layer_{i}_ln2_beta'] = np.zeros(embed_dim)
-        params[f'layer_{i}_ff_w1'] = np.random.randn(embed_dim, embed_dim*4) * 0.02
+        params[f'layer_{i}_ff_w1'] = np.random.randn(embed_dim, embed_dim*4) * 0.05
         params[f'layer_{i}_ff_b1'] = np.zeros(embed_dim*4)
-        params[f'layer_{i}_ff_w2'] = np.random.randn(embed_dim*4, embed_dim) * 0.02
+        params[f'layer_{i}_ff_w2'] = np.random.randn(embed_dim*4, embed_dim) * 0.05
         params[f'layer_{i}_ff_b2'] = np.zeros(embed_dim)
 
     return params

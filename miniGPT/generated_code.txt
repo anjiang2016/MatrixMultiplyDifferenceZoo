@@ -1,1 +1,21 @@
-def conv(                                                                                                                                                                                                        
+<BOS>def download_file(url, filename):
+pol(filenarl_bastirn ostracckwi=Truenum_less(izelos=1, targetalse=True)
+    dic(filesig= didinu(X, 'oppadig=0):
+        target_files(f.ubsize= unitstame
+    diteruns = intersection rent('unpub'):
+        f in in int = conv(pred_besctiest('):
+                   daturn r   rersesh_lent(filepoch)
+        return in resize = int.und(atesst_dir, 'b') ast_dirue_ction return reth_ctory=np.usum())
+        return in resum_samples, 'traing_dinubelsttirn())
+             rgt(urndict, hoces, 'tersesit-ley_b)
+         cipt(filepath, unt_belu()):
+        weights['rb'] = return res
+        axes[i, unt_belsenit(f")
+        print(f"训练 Eprint('):
+        poch = ur, coph.join('int_size, 'ret')
+    intstale:
+              logits ret_urnint()
+            for i in range(', 'rb'):
+              in rackwati, ch = loss.ipth('relus[i, j], weights['conv2']
+           in  ic = np.zer_cols
+                    weight_
