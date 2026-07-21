@@ -15,6 +15,7 @@ data_road/
 __pycache__/
 *.pyc
 *.pyo
+*.DS_Store
 
 #.swp
 #.swo

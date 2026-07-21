@@ -247,7 +247,8 @@ def train_yolo(data_dir, img_size=416, epochs=1, batch_size=2, lr=0.001,lr_step_
 
             pred, caches = forward_yolo(batch_images, weights)
             # 在损失计算时传入权重
-            loss, loss_comp = yolo_loss(pred, batch_targets, num_classes, class_weights=class_weights)
+#            loss, loss_comp = yolo_loss(pred, batch_targets, num_classes, class_weights=class_weights)
+            loss, loss_comp = yolo_loss(pred, batch_targets, num_classes)
             total_loss += loss
 
             box_loss = loss_comp["box"]

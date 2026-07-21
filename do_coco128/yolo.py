@@ -171,7 +171,11 @@ def yolo_loss(pred, targets, num_classes, grid_size=13, lambda_coord=5.0, lambda
 
         loss_cls = 0.0
         for c in range(num_classes):
-            loss_cls += np.sum(coord_mask * class_weights[c]*(pred_cls[b, c] - cls_t[c]) ** 2)
+            if class_weights is not None:
+                loss_cls += np.sum(coord_mask * class_weights[c]*(pred_cls[b, c] - cls_t[c]) ** 2)
+            else:
+                loss_cls += np.sum(coord_mask *(pred_cls[b, c] - cls_t[c]) ** 2)
+                
         loss_box = 0.0
         loss_box = lambda_coord*(loss_tx+loss_ty+loss_tw+loss_th)
         loss_obj = 0.0

@@ -93,7 +93,7 @@ def load_single_image(path, target_size=(32, 32)):
     # 读取图片（使用 PIL，可替换为 cv2.imread）
     img = Image.open(img_path).convert('RGB')   # 确保 RGB
     rgb = np.array(img, dtype=np.uint8)         # (H, W, 3) uint8
-
+    import pdb;pdb.set_trace()
     # 转灰度
     gray = rgb_to_grayscale(rgb)                # (H, W) float32, 范围 0-255
 
