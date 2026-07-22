@@ -790,6 +790,7 @@ def d_matmul(dout, a, b):
     da = np.matmul(dout, b.T)
     db = np.matmul(a.T, dout)
     return da, db
+'''
 def adam_update(params, m, v, grads, lr, step,beta1=0.9, beta2=0.999, eps=1e-8):
     for key in params:
         if key not in grads:
@@ -798,3 +799,45 @@ def adam_update(params, m, v, grads, lr, step,beta1=0.9, beta2=0.999, eps=1e-8):
         v[key] = beta2 * v.get(key, 0) + (1 - beta2) * (grads[key] ** 2)
         params[key] -= lr * m[key] / (np.sqrt(v[key]) + eps)
     return params, m, v, step + 1
+'''
+def adam_update(params, grads, lr, step, beta1=0.9, beta2=0.999, eps=1e-8):
+    """
+    Adam 优化器
+    params: 参数字典
+    grads: 梯度字典（与 params 键对应）
+    lr: 学习率
+    step: 当前步数（从1开始）
+    beta1: 一阶矩衰减率
+    beta2: 二阶矩衰减率
+    eps: 数值稳定小量
+    返回: (更新后的 params, 新的 step)
+    """
+    # 初始化动量存储（如果尚未存在）
+    if not hasattr(adam_update, 'm'):
+        adam_update.m = {}
+        adam_update.v = {}
+    
+    for key in params:
+        # 如果 key 不在 grads 中，跳过（某些层可能没有梯度）
+        if key not in grads:
+            continue
+        
+        g = grads[key]
+        
+        # 如果该参数还没有动量，初始化
+        if key not in adam_update.m:
+            adam_update.m[key] = np.zeros_like(params[key])
+            adam_update.v[key] = np.zeros_like(params[key])
+        
+        # 更新一阶矩和二阶矩
+        adam_update.m[key] = beta1 * adam_update.m[key] + (1 - beta1) * g
+        adam_update.v[key] = beta2 * adam_update.v[key] + (1 - beta2) * (g * g)
+        
+        # 偏差校正
+        m_hat = adam_update.m[key] / (1 - beta1 ** step)
+        v_hat = adam_update.v[key] / (1 - beta2 ** step)
+        
+        # 更新参数
+        params[key] -= lr * m_hat / (np.sqrt(v_hat) + eps)
+    
+    return params, step + 1

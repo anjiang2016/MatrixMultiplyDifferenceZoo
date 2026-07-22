@@ -1,0 +1,11 @@
+file,text
+voice_0001.wav,一
+voice_0002.wav,二
+voice_0003.wav,三
+voice_0004.wav,人
+voice_0005.wav,口
+voice_0006.wav,手
+voice_0007.wav,激活函数relu
+voice_0008.wav,激活函数的导数d_relu
+voice_0009.wav,卷积函数conv
+voice_0010.wav,卷积的导函数d_conv
