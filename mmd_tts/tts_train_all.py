@@ -208,7 +208,7 @@ def create_sample(text="Hello world.", mel_len=50, mel_dim=80):
         'char2idx': char2idx,
         'text': text,
     }
-def load_sample_from_dataset(npz_path='tts_data.npz', sample_idx=3):
+def load_sample_from_dataset(npz_path='tts_data.npz', sample_idx=1):
     """
     从提取好的 tts_data.npz 中加载一个样本
     """
@@ -660,9 +660,9 @@ def decoder(params, encoder_output, mel_targets=None, teacher_forcing=True, max_
 
             # ---- Pre-Net ----
             pre_out, _ = linear(prev_output, params['decoder_pre_w1'], params['decoder_pre_b1'])
-            pre_out,_ = dropout(pre_out, dropout_rate, training=True)
+            pre_out,_ = dropout(pre_out, dropout_rate, training=False)
             pre_out, _ = linear(pre_out, params['decoder_pre_w2'], params['decoder_pre_b2'])
-            pre_out,_ = dropout(pre_out, dropout_rate, training=True)
+            pre_out,_ = dropout(pre_out, dropout_rate, training=False)
             # pre_out: (batch, embed_dim)
             # 添加到历史
             history.append(pre_out)  # (batch, embed_dim)
@@ -995,10 +995,10 @@ def init_tts_params(vocab_size, embed_dim=128, num_heads=8, num_encoder_layers=3
 
     # 解码器各层
     params['decoder_layers'] = num_decoder_layers
-#    params['num_heads'] = num_heads
-#    params['mel_dim'] = mel_dim
+    params['num_heads'] = num_heads
+    params['mel_dim'] = mel_dim
     params['dropout_rate'] = dropout_rate
-#    params['embed_dim'] = embed_dim
+    params['embed_dim'] = embed_dim
 
     # 位置编码
     head_dim = embed_dim // num_heads
@@ -1080,14 +1080,11 @@ def warmup_cosine(epoch, warmup_epochs=10, total_epochs=300, lr_init=1e-4, lr_mi
         progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
         return lr_min + 0.5 * (lr_init - lr_min) * (1 + np.cos(progress * np.pi))
 def train():
-    # 数据
-#    sample = create_sample()
-    sample = load_sample_from_dataset()
-    text_ids = sample['text_ids']
-#mel_target = sample['mel'][:,1:10,:]
-    mel_target = sample['mel']
-    vocab_size = sample['vocab_size']
-
+    # 加载所有样本
+    data = np.load('tts_data.npz', allow_pickle=True)
+    samples = data['samples'].tolist()
+    char2idx = data['char2idx'].item()
+    vocab_size = int(data['vocab_size'])
     # 初始化参数
     best_loss = float('inf')
     params = init_tts_params(vocab_size, embed_dim=256, num_heads=8, num_encoder_layers=3, mel_dim=80)
@@ -1106,31 +1103,31 @@ def train():
 
     # 训练
     epochs =500 
-    lr_init = 0.00001
+    lr_init = 0.0001
     step = 1
 
     for epoch in range(epochs):
         lr = cosine_decay(epoch, total_epochs=epochs, lr_init=lr_init, lr_min=1e-8)
-        # 前向
-        pred_mel, caches = tts(params, text_ids, mel_target, teacher_forcing=True)
-        target_mel = mel_target[:,1:,:] # 去掉第一帧
-        loss = mse_loss(pred_mel, target_mel)
-
-        if (epoch + 1) % 1 == 0:
-            print(f"Epoch {epoch+1}/{epochs}, Loss: {loss:.6f}")
-        for epoch in range(epochs):
-        # ... 训练代码 ...
-            if loss < best_loss:
-                best_loss = loss
-                np.savez('tts_best.npz', **params, step=step,best_loss=best_loss)
-                print(f"✅ 最佳模型已保存，loss={best_loss:.6f}")
-        # 反向
-        dloss = d_mse_loss(pred_mel, target_mel)
-        grads = d_tts(dloss, caches, params)
-        for key in grads:
-            grads[key] = np.clip(grads[key], -1.0, 1.0)
-        # 更新
-        params, step = adam_update(params, grads, lr, step)
+        total_loss=0
+        for idx,sample in enumerate(samples):
+            text_ids = np.array([sample['text_ids']], dtype=np.int32)
+            mel = sample['mel'][None, :, :]  # 加 batch 维度 (1, T, 80)
+            # ---- 归一化到 [-1, 1] ----
+            mel_min = -80.0   # log-mel 的最小值（通常为 -80）
+            mel_max = 0.0     # log-mel 的最大值（通常为 0）
+            mel_target = (mel - mel_min) / (mel_max - mel_min) * 2.0 - 1.0
+            # 前向
+            pred_mel, caches = tts(params, text_ids, mel_target, teacher_forcing=True)
+            target_mel = mel_target[:,1:,:] # 去掉第一帧
+            loss = mse_loss(pred_mel, target_mel)
+            total_loss +=loss
+            # 反向
+            dloss = d_mse_loss(pred_mel, target_mel)
+            grads = d_tts(dloss, caches, params)
+            for key in grads:
+                grads[key] = np.clip(grads[key], -1.0, 1.0)
+            # 更新
+            params, step = adam_update(params, grads, lr, step)
 		# ---- SGD 更新 ----
 #        for key in params:
 #            if key in grads:
@@ -1141,6 +1138,15 @@ def train():
 #            # 只裁剪权重矩阵，不裁剪偏置和LayerNorm参数（可选）
 #            if key.endswith('_w') or key.endswith('_w_q') or key.endswith('_w_k') or key.endswith('_w_v') or key.endswith('_w_o') or key.endswith('_w_loc') or key.endswith('_w_out'):
 #                params[key] = np.clip(params[key], -clip_weight, clip_weight)
+        avg_loss = total_loss/len(samples)
+        if (epoch + 1) % 1 == 0:
+            print(f"Epoch {epoch+1}/{epochs}, Avg Loss: {avg_loss:.6f}")
+        for epoch in range(epochs):
+        # ... 训练代码 ...
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                np.savez('tts_best.npz', **params, step=step,best_loss=best_loss)
+                print(f"✅ 最佳模型已保存，loss={best_loss:.6f}")
 
     print("训练完成！")
 	# 训练完成后保存模型参数

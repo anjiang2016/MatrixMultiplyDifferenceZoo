@@ -25,7 +25,7 @@ def mel_to_audio(mel, sr=16000, n_mels=80, hop_length=256, n_iter=32):
 def generate(text, model_path='tts_best.npz', output_path='output.wav'):
     # 加载分词器（从之前保存的数据中加载）
 
-    sample = load_sample_from_dataset()
+    sample = load_sample_from_dataset(npz_path='tts_data.npz', sample_idx=3)
     char2idx = sample['char2idx']
     mel_target = sample['mel']
     vocab_size = int(sample['vocab_size'])
@@ -34,35 +34,40 @@ def generate(text, model_path='tts_best.npz', output_path='output.wav'):
     text_ids = np.array([[char2idx.get(c, 0) for c in text]], dtype=np.int32)
     print(f"📝 文本: {text}")
 
-    params = init_tts_params(vocab_size, embed_dim=256, num_heads=8, num_encoder_layers=3, mel_dim=80)
+#params = init_tts_params(vocab_size, embed_dim=256, num_heads=8, num_encoder_layers=3, mel_dim=80)
     # 加载模型参数
     data = np.load(model_path, allow_pickle=True)
     print(f"✅ 加载模型参数: {model_path}")
-    best_params = {key: data[key].item() if data[key].dtype == np.dtype('O') else data[key] for key in data.files}
+    params = {key: data[key].item() if data[key].dtype == np.dtype('O') else data[key] for key in data.files}
     best_loss = float(data['best_loss'])
     # 只更新模型权重，不改变结构参数
-    for key in best_params:
-        if key in params:
-            params[key] = best_params[key]
+#for key in best_params:
+#        if key in params:
+#            params[key] = best_params[key]
     print("✅ 从 tts_best.npz 恢复模型参数")
     # 检查是否有 best_loss 字段
     if 'best_loss' in data:
         print(f"Saved best_loss: {data['best_loss']}")
     else:
         print("No best_loss field in file")
-
+    # 打印关键权重的形状和统计
+    print("=== 加载的模型参数统计 ===")
+    for key in ['embed_weight', 'output_w', 'decoder_w_out', 'attn_w_q']:
+        if key in params:
+            print(f"{key}: shape={params[key].shape}, mean={params[key].mean():.6f}, std={params[key].std():.6f}")
+        else:
+            print(f"{key}: 不存在！")
     # 推理
 #pred_mel_,_ = tts(params, text_ids, mel_targets=mel_target, teacher_forcing=True)
-    pred_mel_,_ = tts(params, text_ids, mel_targets=None, teacher_forcing=False,max_len=180)
-#loss = mse_loss(pred_mel, target_mel)
-    '''
+    pred_mel_,_ = tts(params, text_ids, mel_targets=None, teacher_forcing=False,max_len=17)
+    
     pred_mel = pred_mel_[0]
     print(f"🎵 生成梅尔频谱: {pred_mel.shape}")
     print("pred_mel 统计:")
     print(f"  mean: {pred_mel.mean():.6f}, std: {pred_mel.std():.6f}")
     print(f"  min: {pred_mel.min():.6f}, max: {pred_mel.max():.6f}")
     print(f"  帧间差异 (相邻帧差的绝对值平均): {np.abs(np.diff(pred_mel, axis=1)).mean():.6f}")
-    mel_targets=mel_target[:, :-1, :]
+    mel_targets=mel_target[:, 1:, :]
     loss = mse_loss(pred_mel_, mel_targets)
     print(f"   loss:{loss:.6f}")
     print("\nmel_target 统计:")
@@ -77,7 +82,7 @@ def generate(text, model_path='tts_best.npz', output_path='output.wav'):
     # 逐帧 MSE
     frame_mse = np.mean((pred_mel_ - mel_targets) ** 2, axis=(0, 2))
     print(f"Frame MSE: min={frame_mse.min():.6f}, max={frame_mse.max():.6f}, mean={frame_mse.mean():.6f}")
-    '''
+    
     # 合成音频
     audio = mel_to_audio(pred_mel_)
     sf.write(output_path, audio, 16000)
@@ -85,4 +90,5 @@ def generate(text, model_path='tts_best.npz', output_path='output.wav'):
 
 if __name__ == "__main__":
     text = sys.argv[1] if len(sys.argv) > 1 else "二"
-    generate(text)
+#    generate(text,'best_model/tts_best.npz')
+    generate(text,'tts_best.npz')
