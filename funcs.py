@@ -670,12 +670,11 @@ def d_relu(x, y=None):
         return (x > 0).astype(np.float32)
 def silu(x):
     """SiLU (Swish) 激活函数: x * sigmoid(x)"""
-    sig = 1.0 / (1.0 + np.exp(-x))
-    return x * sig
+    return x * sigmoid(x)
 
 def d_silu(dout, x):
     """SiLU 导数: dout * (sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x)))"""
-    sig = 1.0 / (1.0 + np.exp(-x))
+    sig = sigmoid(x)
     # 简化版导数: sig * (1 + x * (1 - sig))
     grad = sig * (1 + x * (1 - sig))
     return dout * grad
