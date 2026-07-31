@@ -4,7 +4,7 @@ bev_lss/bev_output_half
 bev_lss/bev_output_with_annotations
 bev_lss/bev_stitch_output
 bev_lss/samples_output_with_annotations
-
+do_nuscenes/bev_frames
 #t 忽略数据集文件夹
 *.so
 *.dSYM
