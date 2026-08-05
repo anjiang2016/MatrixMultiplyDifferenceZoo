@@ -351,7 +351,7 @@ def d_focal_loss(heatmap_pred, heatmap_gt, alpha=0.25, gamma=2.0):
     grad = -alpha_t * (1 - p_t) ** gamma * (gamma * p_t * np.log(p_t + 1e-8) + p_t - 1) * (2 * pos_mask - 1)
     # 裁剪梯度
     grad = np.clip(grad, -10.0, 10.0)
-    grad = grad - grad
+    grad = grad-grad
     return grad
 def focal_loss_(heatmap_pred, heatmap_gt, alpha=2.0, beta=4.0):
     pred = sigmoid(heatmap_pred)
@@ -378,9 +378,9 @@ def reg_l1_loss(reg_pred, reg_gt, heatmap_gt):
     if np.sum(pos_mask) == 0:
         return 0.0
     # 扩展掩码到 (B, 8, X, Y)
-    print(pos_mask.sum())
+#print(pos_mask.sum())
     pos_mask_expanded = np.repeat(pos_mask[:, None, :, :], reg_pred.shape[1], axis=1)  # (B, 8, X, Y)
-    print(reg_pred[pos_mask_expanded] - reg_gt[pos_mask_expanded])
+#print(reg_pred[pos_mask_expanded] - reg_gt[pos_mask_expanded])
     return np.mean(np.abs(reg_pred[pos_mask_expanded] - reg_gt[pos_mask_expanded]))
 
 def d_reg_l1_loss(reg_pred, reg_gt, heatmap_gt):
@@ -391,15 +391,16 @@ def d_reg_l1_loss(reg_pred, reg_gt, heatmap_gt):
     pos_mask_expanded = np.repeat(pos_mask[:, None, :, :], reg_pred.shape[1], axis=1)
     grad[pos_mask_expanded] = np.sign(reg_pred[pos_mask_expanded] - reg_gt[pos_mask_expanded]) / np.sum(pos_mask)
     return grad
-
 def depth_loss(depth_pred, depth_gt):
     """
-    depth_pred: (B, D, H, W) logits
-    depth_gt: (B, H, W) 整数索引，-1 表示忽略
+    depth_pred: (B, N, D, H, W) logits
+    depth_gt: (B, N, H, W) 整数索引，-1 表示忽略
+    返回: 平均损失, cache (用于反向传播)
     """
-    B, D, H, W = depth_pred.shape
-    pred_flat = depth_pred.transpose(0, 2, 3, 1).reshape(-1, D)
-    gt_flat = depth_gt.reshape(-1)
+    B, N, D, H, W = depth_pred.shape
+    # 展平 batch 和相机维度
+    pred_flat = depth_pred.reshape(B*N, D, H, W).transpose(0, 2, 3, 1).reshape(-1, D)  # (B*N*H*W, D)
+    gt_flat = depth_gt.reshape(-1)  # (B*N*H*W,)
     valid = gt_flat >= 0
     if np.sum(valid) == 0:
         return 0.0, None
@@ -407,9 +408,55 @@ def depth_loss(depth_pred, depth_gt):
     gt_valid = gt_flat[valid]
     log_probs = np.log(probs[valid] + 1e-8)
     loss = -np.mean(log_probs[np.arange(len(gt_valid)), gt_valid])
-    cache = (valid, probs, gt_valid, B, D)   # 只缓存 5 个
+    cache = (valid, probs, gt_valid, B, N, D, H, W)
     return loss, cache
 def d_depth_loss(depth_pred, depth_gt, cache=None):
+    """
+    depth_pred: (B, N, D, H, W) logits
+    depth_gt: (B, N, H, W) 标签
+    cache: 来自 depth_loss 的缓存
+    返回: (B, N, D, H, W) 梯度
+    """
+    B, N, D, H, W = depth_pred.shape
+    if cache is not None:
+        valid, probs, gt_valid, B, N, D, H, W = cache
+    else:
+        pred_flat = depth_pred.reshape(B*N, D, H, W).transpose(0, 2, 3, 1).reshape(-1, D)
+        gt_flat = depth_gt.reshape(-1)
+        valid = gt_flat >= 0
+        if np.sum(valid) == 0:
+            return np.zeros_like(depth_pred)
+        probs, _ = softmax(pred_flat, axis=1)
+        gt_valid = gt_flat[valid]
+    N_valid = np.sum(valid)
+    if N_valid == 0:
+        return np.zeros_like(depth_pred)
+    grad_flat = np.zeros((B*N*H*W, D), dtype=np.float32)
+    one_hot = np.zeros((N_valid, D), dtype=np.float32)
+    one_hot[np.arange(N_valid), gt_valid] = 1.0
+    grad_flat[valid] = (probs[valid] - one_hot) / N_valid
+    grad = grad_flat.reshape(B*N, H, W, D).transpose(0, 3, 1, 2).reshape(B, N, D, H, W)
+    return grad
+def depth_loss1(depth_pred, depth_gt):
+    """
+    depth_pred: (B, D, H, W) logits
+    depth_gt: (B, H, W) 整数索引，-1 表示忽略
+    """
+    B,D, H, W = depth_pred.shape
+    pred_flat = depth_pred.transpose(0, 2, 3, 1).reshape(-1, D)
+    gt_flat = depth_gt.reshape(-1)
+    valid = gt_flat >= 0
+    print(valid.sum())
+    if np.sum(valid) == 0:
+        return 0.0, None
+    probs, _ = softmax(pred_flat, axis=1)
+    gt_valid = gt_flat[valid]
+    print(gt_valid)
+    log_probs = np.log(probs[valid] + 1e-8)
+    loss = -np.mean(log_probs[np.arange(len(gt_valid)), gt_valid])
+    cache = (valid, probs, gt_valid, B, D)   # 只缓存 5 个
+    return loss, cache
+def d_depth_loss1(depth_pred, depth_gt, cache=None):
     """
     depth_pred: (B, D, H, W) logits
     depth_gt: (B, H, W) 标签
@@ -437,7 +484,6 @@ def d_depth_loss(depth_pred, depth_gt, cache=None):
     one_hot[np.arange(N_valid), gt_valid] = 1.0
     grad_flat[valid] = (probs[valid] - one_hot) / N_valid
     grad = grad_flat.reshape(B, H, W, D).transpose(0, 3, 1, 2)
-    grad = grad - grad
     return grad
 def compute_losses(heatmap_pred, reg_pred, heatmap_gt, reg_gt, depth_pred=None, depth_gt=None,
                    hm_weight=1.0, reg_weight=1.0, depth_weight=1.0):

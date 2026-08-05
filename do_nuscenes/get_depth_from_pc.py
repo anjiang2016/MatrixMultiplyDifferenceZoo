@@ -147,10 +147,12 @@ def project_lidar_to_image(points_3xN,
 
     # 3. 全局 -> 自车 (相机时刻)
     R_global_ego = quat_to_rot(ego_cam_rot).T  # 逆旋转
+#R_global_ego = np.linalg.inv(quat_to_rot(ego_cam_rot)) # 逆旋转
     pts = R_global_ego @ (pts - np.array(ego_cam_trans).reshape(3,1))
 
     # 4. 自车 -> 相机 (相机坐标系)
     R_ego_cam = quat_to_rot(cam_rot).T
+#R_ego_cam = np.linalg.inv(quat_to_rot(cam_rot))
     pts = R_ego_cam @ (pts - np.array(cam_trans).reshape(3,1))
 
     depths = pts[2, :]  # 深度

@@ -328,12 +328,38 @@ def generate_reg_gt(anns, ego_pose_mat, bev_size):
             reg_gt[0, 6, gx, gy] = np.cos(yaw)
             reg_gt[0, 7, gx, gy] = pos_ego[2]  # depth
     return reg_gt
+import numpy as np
 
-def generate_depth_gt(sample_token, Hf, Wf):
+def min_pooling_depth_map(u, v, depth, img_h, img_w, invalid_val=-1):
+    """
+    生成稀疏深度图：每个像素只保留投影到该点的所有雷达点中深度最小的那个。
+    
+    参数：
+        u, v: 像素坐标 (N,)，int 类型
+        depth: 对应点的深度值 (N,)，float 类型
+        img_h, img_w: 图像高度和宽度
+        invalid_val: 无效像素填充值（通常用 -1）
+    
+    返回：
+        depth_map: (img_h, img_w) 的稀疏深度图
+    """
+    # 1. 初始化深度图为很大的正数（这样第一次赋值时就会被替换）
+    depth_map = np.full((img_h, img_w), np.inf, dtype=np.float32)
+    
+    # 2. 使用 np.minimum.at 进行最小池化
+    # np.minimum.at(depth_map, (v, u), depth)
+    # 将 depth_map[v[i], u[i]] 与 depth[i] 比较，保留较小值
+    np.minimum.at(depth_map, (v, u), depth)
+    
+    # 3. 将未赋值的位置（仍为 np.inf）替换为 invalid_val
+    depth_map[np.isinf(depth_map)] = invalid_val
+    
+    return depth_map
+def generate_depth_gt_(sample_token, Hf, Wf):
     # 暂时使用随机深度
     depth_gt = np.random.randint(0, DEPTH_BINS, size=(1, Hf, Wf)).astype(np.int32)
     return depth_gt
-def generate_depth_gt_(sample_token, data_root, Hf, Wf, depth_bins=41, depth_range=(4.0, 45.0)):
+def generate_depth_gt(sample_token, data_root, Hf, Wf, depth_bins=41, depth_range=(4.0, 45.0)):
     """
     从激光雷达点云生成深度真值图，仅前摄像头
     """
@@ -342,109 +368,138 @@ def generate_depth_gt_(sample_token, data_root, Hf, Wf, depth_bins=41, depth_ran
     sensors = load_json('v1.0-mini/sensor.json')
     calib_sensors = load_json('v1.0-mini/calibrated_sensor.json')
     ego_poses = load_json('v1.0-mini/ego_pose.json')
+    def build_index(data_list, key='token'):
+        """根据 token 建立字典索引"""
+        return {item[key]: item for item in data_list}
+    # 建立索引
+    sample_data_idx = build_index(sample_data_list)
+    calibrated_sensor_idx = build_index(calib_sensors)
+    ego_pose_idx = build_index(ego_poses)
+    sensor_idx = build_index(sensors)
 
-    # 构建映射
-    sensor_token_to_channel = {s['token']: s['channel'] for s in sensors}
-    calib_token_to_intrin = {}
-    calib_token_to_extrin = {}
-    calib_token_to_sensor_token = {}
-    for cs in calib_sensors:
-        token = cs['token']
-        if 'camera_intrinsic' in cs:
-            calib_token_to_intrin[token] = np.array(cs['camera_intrinsic'])
-        calib_token_to_extrin[token] = {
-            'rotation': cs['rotation'],
-            'translation': cs['translation']
-        }
-        calib_token_to_sensor_token[token] = cs['sensor_token']
-    ego_pose_map = {ep['token']: ep for ep in ego_poses}
+    depth_gt_N = np.zeros((1,6,Hf,Wf),dtype=np.int32)
+    idx = 0
+    for CAM_CHANNEL in CAMERAS:
+        # 查找 LIDAR_TOP 和摄像头
+        lidar_sd = None
+        cam_sd = None
+        for sd in sample_data_list:
+            if sd['sample_token'] != sample_token or not sd['is_key_frame']:
+                continue
+            calib_token = sd['calibrated_sensor_token']
+            calib = calibrated_sensor_idx.get(calib_token)
+            if calib is None:
+                continue
+            sensor = sensor_idx.get(calib.get('sensor_token'))
+            if sensor is None:
+                continue
+            channel = sensor.get('channel')
+            if channel == 'LIDAR_TOP':
+                lidar_sd = sd
+            elif channel == CAM_CHANNEL:
+                cam_sd = sd
+        if lidar_sd is None or cam_sd is None:
+            return np.full((1, Hf, Wf), -1, dtype=np.int32)
+    
+        # ========== 3. 读取标定和位姿信息 ==========
+        def get_calibration(calib_token):
+            calib = calibrated_sensor_idx.get(calib_token)
+            if calib is None:
+                return None, None, None
+            rot = calib['rotation']  # [w, x, y, z]
+            trans = calib['translation']  # [x, y, z]
+            intrinsic = calib.get('camera_intrinsic')  # 仅相机有
+            return rot, trans, intrinsic
+      
+        def get_ego_pose(pose_token):
+            pose = ego_pose_idx.get(pose_token)
+            if pose is None:
+                return None, None
+            return pose['rotation'], pose['translation']
+    
+        # 相机标定
+        cam_rot, cam_trans, cam_intrinsic = get_calibration(cam_sd['calibrated_sensor_token'])
+        # 雷达标定
+        lidar_rot, lidar_trans, _ = get_calibration(lidar_sd['calibrated_sensor_token'])
+        # 相机 ego_pose
+        cam_ego_rot, cam_ego_trans = get_ego_pose(cam_sd['ego_pose_token'])
+        # 雷达 ego_pose
+        lidar_ego_rot, lidar_ego_trans = get_ego_pose(lidar_sd['ego_pose_token'])
+        # 加载点云
+        lidar_path = os.path.join(data_root, lidar_sd['filename'])
+        points = np.fromfile(lidar_path, dtype=np.float32).reshape(-1, 4)[:, :3].T
+    
+        # ========== 5. 投影函数（四元数转旋转矩阵） ==========
+        def quat_to_rot(q):
+            w, x, y, z = q[0], q[1], q[2], q[3]
+            return np.array([
+                [1 - 2*y*y - 2*z*z, 2*x*y - 2*z*w,     2*x*z + 2*y*w],
+                [2*x*y + 2*z*w,     1 - 2*x*x - 2*z*z, 2*y*z - 2*x*w],
+                [2*x*z - 2*y*w,     2*y*z + 2*x*w,     1 - 2*x*x - 2*y*y]
+            ])
+    
+        # 1. 雷达 -> 自车 (雷达时刻)
+        R_lidar_ego = quat_to_rot(lidar_rot)
+        pts = R_lidar_ego @ points + np.array(lidar_trans).reshape(3,1)
+    
+        # 2. 自车 -> 全局 (雷达时刻)
+        R_ego_global = quat_to_rot(lidar_ego_rot)
+        pts = R_ego_global @ pts + np.array(lidar_ego_trans).reshape(3,1)
+    
+        # 3. 全局 -> 自车 (相机时刻)
+        R_global_ego = quat_to_rot(cam_ego_rot).T# 逆旋转
+        pts = R_global_ego @ (pts - np.array(cam_ego_trans).reshape(3,1))
+    
+        # 4. 自车 -> 相机 (相机坐标系)
+        R_ego_cam = quat_to_rot(cam_rot).T
+        pts = R_ego_cam @ (pts - np.array(cam_trans).reshape(3,1))
+    
+        depths = pts[2, :]  # 深度
+    
+        # 5. 投影到图像
+        img_pts = np.array(cam_intrinsic) @ pts  # (3, N)
+        u = img_pts[0, :] / img_pts[2, :]
+        v = img_pts[1, :] / img_pts[2, :]
+        
+        # 6. 过滤
+        img_h, img_w = 900, 1600
+        mask = (depths > 0) & (u >= 0) & (u < img_w) & (v >= 0) & (v < img_h)
+        mask &= np.isfinite(u) & np.isfinite(v) & np.isfinite(depths)
+    
+        u = u[mask].astype(np.int32)
+        v = v[mask].astype(np.int32)
+        depth = depths[mask]
+        if len(depth) == 0:
+            return np.full((1, Hf, Wf), -1, dtype=np.int32)
+    
+        # 离散化深度
+        d_min, d_max = depth_range
+        depth_bins_edges = np.linspace(d_min, d_max, depth_bins+1)
+        depth_indices = np.clip(np.digitize(depth, depth_bins_edges) - 1, 0, depth_bins-1)
+    
+        # 创建深度图
+        depth_map = np.full((img_h, img_w), -1, dtype=np.int32)
+        # 更稳妥：按深度降序排列，这样近处点（小深度）排在最后，赋值时覆盖前面远处的点
+        order = np.argsort(depth)[::-1]  # 降序（远 -> 近）
+        u_sorted = u[order]
+        v_sorted = v[order]
+        depth_idx_sorted = depth_indices[order]
+        depth_map[v_sorted, u_sorted] = depth_idx_sorted
+        depth_map[v, u] = depth_indices
+        # 下采样到特征图尺寸（最近邻）
+        from scipy.ndimage import zoom
+        # 计算缩放因子
+        scale_h = Hf / img_h
+        scale_w = Wf / img_w
+        depth_gt = zoom(depth_map.astype(np.float32), (scale_h, scale_w), order=0, mode='nearest')
+        depth_gt = depth_gt.astype(np.int32)
+        depth_gt = depth_gt[None, :, :]  # (1, Hf, Wf)
+        depth_gt_N[0,idx:idx+1] = depth_gt
+        idx=idx+1
+    return depth_gt_N
 
-    # 查找 LIDAR_TOP 和前摄像头
-    lidar_sd = None
-    cam_sd = None
-    for sd in sample_data_list:
-        if sd['sample_token'] != sample_token or not sd['is_key_frame']:
-            continue
-        calib_token = sd['calibrated_sensor_token']
-        sensor_token = calib_token_to_sensor_token.get(calib_token)
-        if sensor_token is None:
-            continue
-        channel = sensor_token_to_channel.get(sensor_token)
-        if channel == 'LIDAR_TOP':
-            lidar_sd = sd
-        elif channel == 'CAM_FRONT':
-            cam_sd = sd
-    if lidar_sd is None or cam_sd is None:
-        return np.full((1, Hf, Wf), -1, dtype=np.int32)
-
-    # 加载点云
-    lidar_path = os.path.join(data_root, lidar_sd['filename'])
-    points = np.fromfile(lidar_path, dtype=np.float32).reshape(-1, 5)[:, :3]
-
-    # 获取标定
-    cam_calib_token = cam_sd['calibrated_sensor_token']
-    intrin = calib_token_to_intrin.get(cam_calib_token)
-    if intrin is None:
-        return np.full((1, Hf, Wf), -1, dtype=np.int32)
-
-    extrin_data = calib_token_to_extrin[cam_calib_token]
-    R_sensor2ego = quaternion_to_rotation_matrix(extrin_data['rotation'])
-    t_sensor2ego = np.array(extrin_data['translation'])
-    T_sensor2ego = np.eye(4)
-    T_sensor2ego[:3, :3] = R_sensor2ego
-    T_sensor2ego[:3, 3] = t_sensor2ego
-    T_ego2sensor = np.linalg.inv(T_sensor2ego)
-
-    ego_pose_token = cam_sd['ego_pose_token']
-    ego_pose = ego_pose_map[ego_pose_token]
-    R_ego2global = quaternion_to_rotation_matrix(ego_pose['rotation'])
-    t_ego2global = np.array(ego_pose['translation'])
-    T_ego2global = np.eye(4)
-    T_ego2global[:3, :3] = R_ego2global
-    T_ego2global[:3, 3] = t_ego2global
-    T_global2ego = np.linalg.inv(T_ego2global)
-
-    # 全局→自车→相机
-    points_ego = (T_global2ego[:3, :3] @ points.T).T + T_global2ego[:3, 3]
-    points_cam = (T_ego2sensor[:3, :3] @ points_ego.T).T + T_ego2sensor[:3, 3]
-    valid_mask = points_cam[:, 2] > 0
-    points_cam = points_cam[valid_mask]
-    if points_cam.shape[0] == 0:
-        return np.full((1, Hf, Wf), -1, dtype=np.int32)
-
-    # 投影到图像
-    fx, fy = intrin[0,0], intrin[1,1]
-    cx, cy = intrin[0,2], intrin[1,2]
-    u = (points_cam[:, 0] * fx) / points_cam[:, 2] + cx
-    v = (points_cam[:, 1] * fy) / points_cam[:, 2] + cy
-    depth = points_cam[:, 2]
-
-    img_h, img_w = 900, 1600
-    mask = (u >= 0) & (u < img_w) & (v >= 0) & (v < img_h)
-    u = u[mask].astype(np.int32)
-    v = v[mask].astype(np.int32)
-    depth = depth[mask]
-    if len(depth) == 0:
-        return np.full((1, Hf, Wf), -1, dtype=np.int32)
-
-    # 离散化深度
-    d_min, d_max = depth_range
-    depth_bins_edges = np.linspace(d_min, d_max, depth_bins+1)
-    depth_indices = np.clip(np.digitize(depth, depth_bins_edges) - 1, 0, depth_bins-1)
-
-    # 创建深度图
-    depth_map = np.full((img_h, img_w), -1, dtype=np.int32)
-    depth_map[v, u] = depth_indices
-
-    # 下采样到特征图尺寸（最近邻）
-    from scipy.ndimage import zoom
-    # 计算缩放因子
-    scale_h = Hf / img_h
-    scale_w = Wf / img_w
-    depth_gt = zoom(depth_map.astype(np.float32), (scale_h, scale_w), order=0, mode='nearest')
-    depth_gt = depth_gt.astype(np.int32)
-    depth_gt = depth_gt[None, :, :]  # (1, Hf, Wf)
-    return depth_gt
+    #depth_gt = min_pooling_depth_map(u,v,depth_map,Hf,Wf)
+#return depth_gt
 # ============================
 # 训练主循环
 # ============================
@@ -474,18 +529,18 @@ def main():
         geom_indices_cache[token] = [build_geometry_indices(token, model_params, H, W, Hf, Wf)]
 
     # 超参数
-    lr_init = 1e-3
-    epochs = 10
-    hm_weight = 0.1
+    lr_init = 1e-6
+    epochs = 100
+    hm_weight = 266.4
     reg_weight = 1.0
-    depth_weight = 1.0
+    depth_weight = 18.4
 
     step =1
     m, v = None, None
 
     for epoch in range(epochs):
         total_loss = 0.0
-        lr = cosine_annealing(epoch,epochs,lr_init=lr_init,lr_min=1e-6) 
+        lr = cosine_annealing(epoch,epochs,lr_init=lr_init,lr_min=1e-11) 
 #        for sample_token in tqdm(sample_tokens, desc=f"Epoch {epoch+1}/{epochs}"):
         for sample_token in tqdm([sample_tokens[2]], desc=f"Epoch {epoch+1}/{epochs}"):
             # 1. 加载图像和标定
@@ -511,12 +566,13 @@ def main():
             # 5. 生成 GT
             heatmap_gt = generate_heatmap_gt(anns, ego_pose_mat, BEV_SIZE, sigma=3.0)
             reg_gt = generate_reg_gt(anns, ego_pose_mat, BEV_SIZE)
-            depth_gt = generate_depth_gt(sample_token, Hf, Wf)
-            import pdb;pdb.set_trace()
+#depth_gt = generate_depth_gt(sample_token, Hf, Wf)
+            depth_gt=generate_depth_gt(sample_token, DATA_ROOT, Hf, Wf, depth_bins=41, depth_range=(4.0, 45.0))
             # 6. 堆叠深度 logits（取第一个相机，仅前摄像头）
-            depth_logits_batch = depth_logits_list[0][None, ...]  # (1, D, Hf, Wf)
-
+            #depth_logits_batch = depth_logits_list[0][None, ...]  # (1, D, Hf, Wf)
+            depth_logits_batch = np.stack(depth_logits_list,axis=0)[None,...]
             # 7. 损失计算（加权）
+ 
             losses, loss_caches = compute_losses(
                 heatmap, reg, heatmap_gt, reg_gt,
                 depth_logits_batch, depth_gt,
@@ -531,8 +587,7 @@ def main():
 
             # 9. 构建深度梯度列表（每个相机）
             ddepth_per_cam = [None] * 6
-            ddepth_per_cam[0] = ddepth  # 仅前摄像头有深度梯度
-
+            ddepth_per_cam = [ddepth[0, i, ...] for i in range(6)]
             # 10. 反向传播
             grads = bev_backward(
                 dheatmap, dreg, ddepth_per_cam,
