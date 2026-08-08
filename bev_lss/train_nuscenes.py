@@ -6,8 +6,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import math
 from model import init_model_params, bev_forward, bev_backward, compute_losses, d_compute_losses
-
 from train_test import  clip_gradients,cosine_annealing
+from generate_heatmap import generate_inline_html,save_all_class_heatmaps
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from funcs import sigmoid
 # ============================
 # 配置
 # ============================
@@ -20,9 +23,22 @@ BEV_SIZE = (int((BEV_RANGE[1] - BEV_RANGE[0]) / BEV_RESOLUTION),
             int((BEV_RANGE[1] - BEV_RANGE[0]) / BEV_RESOLUTION))
 DEPTH_BINS = 41
 DEPTH_RANGE = (4.0, 45.0)      # 米
-NUM_CLASSES = 10
 BATCH_SIZE = 1  # 先使用单样本训练
 
+class_mapping = {
+    'movable_object.barrier': 0,
+    'human.pedestrian.adult': 1,
+    'movable_object.trafficcone': 2,
+    'vehicle.car': 3,
+    'vehicle.truck': 4,
+    'human.pedestrian.construction_worker': 5,
+    'vehicle.motorcycle': 6,
+    'vehicle.construction': 7,
+    'vehicle.bicycle': 8,
+    'movable_object.pushable_pullable': 9,
+    'vehicle.bus.rigid': 10,
+}
+NUM_CLASSES = len(class_mapping)  # 11
 # ============================
 # 工具函数
 # ============================
@@ -185,7 +201,7 @@ def load_sample_data(sample_token,target_size=(256,704)):
         T_sensor2ego = np.eye(4)
         T_sensor2ego[:3, :3] = R
         T_sensor2ego[:3, 3] = t
-        calibs[channel] = {'intrin': intrin, 'extrin': T_sensor2ego}
+        calibs[channel] = {'intrin': intrin_scaled, 'extrin': T_sensor2ego}
         # 获取 ego_pose
         ego_pose = ego_pose_map[sd['ego_pose_token']]
         ego_pose_mat = np.eye(4)
@@ -202,7 +218,7 @@ def build_geometry_indices(sample_token, model_params, H, W, Hf, Wf):
     返回: list of (D*Hf*Wf,) 数组，每个相机一个
     """
     # 获取标定
-    _, calib_list, ego_pose_mat = load_sample_data(sample_token)
+    _, calib_list, ego_pose_mat = load_sample_data(sample_token,target_size=(H,W))
     # 预计算每个相机的视锥点云坐标
     depth_bins = DEPTH_BINS
     depth_range = DEPTH_RANGE
@@ -223,7 +239,7 @@ def build_geometry_indices(sample_token, model_params, H, W, Hf, Wf):
         v = np.linspace(0, H-1, Hf, dtype=np.float32)
         uu, vv = np.meshgrid(u, v)
         # 深度值
-        d = np.linspace(depth_range[0], depth_range[1], depth_bins, dtype=np.float32)
+        d = np.linspace(depth_range[0]+0.5, depth_range[1]-0.5, depth_bins, dtype=np.float32)
         # 构建点云坐标 (D, Hf, Wf, 3)
         # 利用内参逆变换
         fx, fy = intrin[0,0], intrin[1,1]
@@ -238,19 +254,25 @@ def build_geometry_indices(sample_token, model_params, H, W, Hf, Wf):
         # 转换到自车坐标系
         R = extrin[:3, :3]
         t = extrin[:3, 3]
-        points_ego = np.einsum('ij,dhwk->dhwi', R, points_cam) + t  # (D, Hf, Wf, 3)
+        points_ego = np.einsum('ik,dhwk->dhwi', R, points_cam) + t  # (D, Hf, Wf, 3)
         # 只保留地面附近点 (z=0)
         # 但我们要将所有点投影到 BEV 网格，并记录网格索引
         x_ego = points_ego[..., 0]
         y_ego = points_ego[..., 1]
         # 计算网格索引
-        gx = ((x_ego - bev_range[0]) / bev_res).astype(np.int32)
-        gy = ((y_ego - bev_range[0]) / bev_res).astype(np.int32)
+        gx_raw = ((x_ego - bev_range[0]) / bev_res).astype(np.int32)
+        gy_raw = ((y_ego - bev_range[0]) / bev_res).astype(np.int32)
+        #import pdb;pdb.set_trace()
+        #gy = bev_size[0] - 1 - gx_raw   # 即使 gx_raw 是 -100，这里算出来会是 199+100=299
+        gy = gx_raw   # 即使 gx_raw 是 -100，这里算出来会是 199+100=299
+        gx = bev_size[1] - 1 - gy_raw
+        #gx = gy_raw
         # 过滤超出范围的点
         mask = (gx >= 0) & (gx < bev_size[0]) & (gy >= 0) & (gy < bev_size[1])
         # 将有效点映射到一维索引
         grid_idx = gx * bev_size[1] + gy
-        grid_idx = grid_idx[mask]
+        grid_idx[~mask] = -1
+        #grid_idx = grid_idx[mask]
         # 展平所有维度
         indices = grid_idx.flatten()
         indices_list.append(indices)
@@ -272,8 +294,50 @@ def get_annotations(sample_token):
                 if cat_name.startswith('vehicle.'):
                     anns.append(ann)
     return anns
+def generate_heatmap_gt(anns, ego_pose_mat, bev_size, class_mapping, instance_to_category, cat_name_map, sigma=3.0):
+    num_classes = len(class_mapping)
+    heatmap_gt = np.zeros((1, num_classes, bev_size[0], bev_size[1]), dtype=np.float32)
 
-def generate_heatmap_gt(anns, ego_pose_mat, bev_size, sigma=3.0):
+    def gaussian_2d(shape, center, sigma):
+        y, x = np.ogrid[:shape[0], :shape[1]]
+        x0, y0 = center
+        return np.exp(-((x - x0)**2 + (y - y0)**2) / (2 * sigma**2))
+
+    ego_pose_inv = np.linalg.inv(ego_pose_mat)
+    R_global2ego = ego_pose_inv[:3, :3]
+    t_global2ego = ego_pose_inv[:3, 3]
+
+    for ann in anns:
+        inst_token = ann.get('instance_token')
+        if inst_token is None:
+            continue
+        cat_token = instance_to_category.get(inst_token)
+        if cat_token is None:
+            continue
+        cat_name = cat_name_map.get(cat_token, 'unknown')
+        class_idx = class_mapping.get(cat_name)
+        if class_idx is None:
+            continue  # 忽略未映射的类别
+
+        pos_global = np.array(ann['translation'])
+        pos_ego = R_global2ego @ pos_global + t_global2ego
+        x, y = pos_ego[0], pos_ego[1]  # 交换（与BEV映射对齐）
+
+        if x < BEV_RANGE[0] or x >= BEV_RANGE[1] or y < BEV_RANGE[0] or y >= BEV_RANGE[1]:
+            continue
+
+        gx = int((x - BEV_RANGE[0]) / BEV_RESOLUTION)
+        gy = int((y - BEV_RANGE[0]) / BEV_RESOLUTION)
+        #gx = bev_size[0] - 1 - gx
+        #gy = bev_size[1] - 1 - gy
+
+        if 0 <= gx < bev_size[0] and 0 <= gy < bev_size[1]:
+            heat = gaussian_2d((bev_size[0], bev_size[1]), (gx, gy), sigma)
+            heatmap_gt[0, class_idx] += heat
+
+    heatmap_gt = np.clip(heatmap_gt, 0, 1)
+    return heatmap_gt
+def generate_heatmap_gt_(anns, ego_pose_mat, bev_size, sigma=3.0):
     heatmap_gt = np.zeros((1, NUM_CLASSES, bev_size[0], bev_size[1]), dtype=np.float32)
     # 高斯核
     def gaussian_2d(shape, center, sigma):
@@ -286,7 +350,7 @@ def generate_heatmap_gt(anns, ego_pose_mat, bev_size, sigma=3.0):
     for ann in anns:
         pos_global = np.array(ann['translation'])
         pos_ego = R_global2ego @ pos_global + t_global2ego
-        x, y = pos_ego[1], pos_ego[0]
+        x, y = pos_ego[0], pos_ego[1]
         if x < BEV_RANGE[0] or x >= BEV_RANGE[1] or y < BEV_RANGE[0] or y >= BEV_RANGE[1]:
             continue
         gx = int((x - BEV_RANGE[0]) / BEV_RESOLUTION)
@@ -309,19 +373,19 @@ def generate_reg_gt(anns, ego_pose_mat, bev_size):
     for ann in anns:
         pos_global = np.array(ann['translation'])
         pos_ego = R_global2ego @ pos_global + t_global2ego
-        x, y = pos_ego[1], pos_ego[0]
+        x, y = pos_ego[0], pos_ego[1]
         if x < BEV_RANGE[0] or x >= BEV_RANGE[1] or y < BEV_RANGE[0] or y >= BEV_RANGE[1]:
             continue
         gx = int((x - BEV_RANGE[0]) / BEV_RESOLUTION)
         gy = int((y - BEV_RANGE[0]) / BEV_RESOLUTION)
-        gx = bev_size[0] - 1 - gx
-        gy = bev_size[1] - 1 - gy
+        #gx = bev_size[0] - 1 - gx
+        #gy = bev_size[1] - 1 - gy
         if 0 <= gx < bev_size[0] and 0 <= gy < bev_size[1]:
             w, l, h = ann['size']
             quat = ann['rotation']
             yaw = np.arctan2(2*(quat[0]*quat[3] + quat[1]*quat[2]),
                              1 - 2*(quat[2]*quat[2] + quat[3]*quat[3]))
-            reg_gt[0, 2, gx, gy] = w
+            reg_gt[0, 2, gx, gy] = w 
             reg_gt[0, 3, gx, gy] = l
             reg_gt[0, 4, gx, gy] = h
             reg_gt[0, 5, gx, gy] = np.sin(yaw)
@@ -500,10 +564,136 @@ def generate_depth_gt(sample_token, data_root, Hf, Wf, depth_bins=41, depth_rang
 
     #depth_gt = min_pooling_depth_map(u,v,depth_map,Hf,Wf)
 #return depth_gt
+def count_categories(sample_tokens):
+    """
+    统计所有样本中出现的类别及其数量
+    返回: dict {category_name: count}
+    """
+    from collections import defaultdict
+    category_counts = defaultdict(int)
+    class_counts = np.zeros(NUM_CLASSES)
+    
+    # 加载必要的 JSON
+    sample_anns = load_json('v1.0-mini/sample_annotation.json')
+    instances = load_json('v1.0-mini/instance.json')
+    categories = load_json('v1.0-mini/category.json')
+    inst_to_cat = {inst['token']: inst['category_token'] for inst in instances}
+    cat_to_name = {cat['token']: cat['name'] for cat in categories}
+    
+    for ann in sample_anns:
+        if ann['sample_token'] in sample_tokens:
+            inst_token = ann['instance_token']
+            if inst_token in inst_to_cat:
+                cat_token = inst_to_cat[inst_token]
+                cat_name = cat_to_name.get(cat_token, 'unknown')
+                category_counts[cat_name] += 1
+                idx = class_mapping.get(cat_name)
+                if idx is not None:
+                    class_counts[idx] += 1
+    
+    return category_counts,class_counts
+def clip_grad_norm(grads, max_norm=1.0):
+    """递归裁剪嵌套梯度的 L2 范数"""
+    total_norm = 0.0
+    def accumulate(g):
+        nonlocal total_norm
+        if isinstance(g, dict):
+            for v in g.values():
+                accumulate(v)
+        elif isinstance(g, list):
+            for v in g:
+                accumulate(v)
+        else:
+            if g is not None:
+                total_norm += np.sum(g ** 2)
+    accumulate(grads)
+    total_norm = np.sqrt(total_norm)
+    if total_norm > max_norm:
+        scale = max_norm / (total_norm + 1e-12)
+        def scale_grads(g):
+            if isinstance(g, dict):
+                for k in g:
+                    scale_grads(g[k])
+            elif isinstance(g, list):
+                for v in g:
+                    scale_grads(v)
+            else:
+                if g is not None:
+                    g *= scale
+        scale_grads(grads)
+    return grads
+def show_pred(heatmap,reg,depth_logits_list):
+    # 在训练循环中，bev_forward 返回后
+    print(f"heatmap max: {heatmap.max():.4f}, min: {heatmap.min():.4f}")
+    print(f"reg max: {reg.max():.4f}, min: {reg.min():.4f}")
+    if depth_logits_list:
+        depth_max = max([d.max() for d in depth_logits_list])
+        depth_min = min([d.min() for d in depth_logits_list])
+        print(f"depth_logits max: {depth_max:.4f}, min: {depth_min:.4f}")
+
+def get_sample_from_st(sample_token,geom_indices,instance_to_category,cat_name_map,H,W,Hf,Wf):
+
+   # 1. 加载图像和标定
+    img_list, calib_list, ego_pose_mat = load_sample_data(sample_token,target_size=(H,W))
+    # 转换为 (1, 6, 3, H, W) 格式
+    images = np.stack([img.transpose(2,0,1) for img in img_list if img is not None], axis=0)  # (6,3,H,W)
+    # 添加 batch 维度
+    images = images[None, ...]  # (1,6,3,H,W)
+    # 如果某个相机缺失，用零填充（但 sample 中应都有）
+    # 调整顺序与 CAMERAS 一致
+     # 略
+
+    # 4. 获取标注
+    anns = get_annotations(sample_token)
+    sample_anns = load_json('v1.0-mini/sample_annotation.json')
+    instances = load_json('v1.0-mini/instance.json')
+    categories = load_json('v1.0-mini/category.json')
+    inst_to_cat = {inst['token']: inst['category_token'] for inst in instances}
+    cat_to_name = {cat['token']: cat['name'] for cat in categories}
+    anns = []
+    for ann in sample_anns:
+        if ann['sample_token'] == sample_token:
+            inst_token = ann['instance_token']
+            if inst_token in inst_to_cat:
+                cat_token = inst_to_cat[inst_token]
+                cat_name = cat_to_name.get(cat_token, 'unknown')
+                if cat_name.startswith('vehicle.'):
+                    anns.append(ann)
+
+    # 5. 生成 GT
+    #heatmap_gt = generate_heatmap_gt(anns, ego_pose_mat, BEV_SIZE, sigma=3.0)
+    heatmap_gt = generate_heatmap_gt(anns, ego_pose_mat, BEV_SIZE, class_mapping, instance_to_category, cat_name_map, sigma=3.0)
+    # 将heatmap_gt 显示为3D
+    #generate_inline_html(heatmap_gt,output_html = 'view_heatmap_inline.html')
+    reg_gt = generate_reg_gt(anns, ego_pose_mat, BEV_SIZE)
+#depth_gt = generate_depth_gt(sample_token, Hf, Wf)
+    depth_gt=generate_depth_gt(sample_token, DATA_ROOT, Hf, Wf, depth_bins=41, depth_range=(4.0, 45.0))
+    sample = {} 
+    sample['images'] = images
+    sample['geom_indices']=geom_indices
+    sample['hm']=heatmap_gt
+    sample['reg']=reg_gt
+    sample['depth']=depth_gt
+    return sample
+
+def get_samples(sts,geom_indices_cache,instance_to_category,H,W,Hf,Wf):
+    # 加载所有必要的 JSON
+    instances = load_json('v1.0-mini/instance.json')
+    categories = load_json('v1.0-mini/category.json')
+    instance_to_category = {inst['token']: inst['category_token'] for inst in instances}
+    cat_name_map = {cat['token']: cat['name'] for cat in categories}
+    sms=[]
+    for st in tqdm(sts,desc="get gt and image list"):
+        geom_indices = geom_indices_cache[st]
+        sm=get_sample_from_st(st,geom_indices_cache[st],instance_to_category,cat_name_map,H,W,Hf,Wf)
+        sms.append(sm)
+    return sms
+
 # ============================
 # 训练主循环
 # ============================
 def main():
+    BEST_MODEL_PATH = 'best_model.npz'   # 保存在当前目录
     # 初始化模型参数
     model_params = init_model_params(
         backbone_in=3,
@@ -517,73 +707,106 @@ def main():
 
     # 获取样本列表
     samples = load_json('v1.0-mini/sample.json')
-    sample_tokens = [s['token'] for s in samples[:20]]  # 使用前20个样本测试
+    sample_tokens = [s['token'] for s in samples[:3]]  # 使用前20个样本测试
+    # 在 main() 中，获取样本列表后
+    category_counts,class_counts = count_categories(sample_tokens)
+    print("=== 类别统计 ===")
+    for cat, count in sorted(category_counts.items(), key=lambda x: -x[1]):
+        print(f"  {cat}: {count}")
+    print("================")
+
+    # 计算 alpha（与频率成反比）
+    max_count = class_counts.max()
+    alphas = 0.8*(1+3.0/(class_counts + 1e-6) - 3.0/(max_count+1e-6))
+    #alphas = alphas / np.sum(alphas) * NUM_CLASSES  # 归一化使均值为1
+    alphas = np.clip(alphas,0.01,0.99)
+    print(f"Per-class alphas: {alphas}")
+
+    # 加载所有必要的 JSON
+    instances = load_json('v1.0-mini/instance.json')
+    categories = load_json('v1.0-mini/category.json')
+    instance_to_category = {inst['token']: inst['category_token'] for inst in instances}
+    cat_name_map = {cat['token']: cat['name'] for cat in categories}
+
+
 
     # 确定特征图尺寸（由模型决定）
     H, W = 256, 704  # 输入图像尺寸（需与模型一致）
+    #H, W = 512, 1408  # 输入图像尺寸（需与模型一致）
     Hf, Wf = H // 32, W // 32  # 8, 22
 
     # 预计算几何索引（耗时，可缓存）
     geom_indices_cache = {}
     for token in tqdm(sample_tokens, desc="Building geometry indices"):
         geom_indices_cache[token] = [build_geometry_indices(token, model_params, H, W, Hf, Wf)]
-
+    samples = get_samples(sample_tokens,geom_indices_cache,instance_to_category,H,W,Hf,Wf)
     # 超参数
-    lr_init = 1e-6
-    epochs = 100
-    hm_weight = 266.4
-    reg_weight = 1.0
-    depth_weight = 18.4
-
-    step =1
+    lr_init = 3e-4
+    epochs = 1000
+    hm_weight = 0.1
+    reg_weight =100.0
+    depth_weight =10.0 
+    # ---------- 尝试加载最佳模型 ----------
+    best_loss = float('inf')
+    start_epoch = 0
     m, v = None, None
+    step = 1
 
-    for epoch in range(epochs):
+    if os.path.exists(BEST_MODEL_PATH):
+        data = np.load(BEST_MODEL_PATH, allow_pickle=True)
+        model_params = data['model_params'].item()          # 恢复模型参数
+        m = data['m'].item() if 'm' in data else {}        # 恢复动量
+        v = data['v'].item() if 'v' in data else {}
+        step = int(data['step']) if 'step' in data else 1
+        best_loss = float(data['best_loss'])                # 历史最佳损失
+        start_epoch = int(data['epoch']) + 1                # 从下一轮开始
+        print(f"✅ 加载最佳模型 (epoch {int(data['epoch'])})，损失 {best_loss:.6f}")
+    else:
+        print("🆕 未找到已有模型，从头训练")
+        m, v = {}, {}   # 确保后续 adam_update 能正确初始化
+        step = 1
+    start_epoch = 0
+    best_loss = float('inf')
+    for epoch in range(start_epoch,epochs):
         total_loss = 0.0
-        lr = cosine_annealing(epoch,epochs,lr_init=lr_init,lr_min=1e-11) 
-#        for sample_token in tqdm(sample_tokens, desc=f"Epoch {epoch+1}/{epochs}"):
-        for sample_token in tqdm([sample_tokens[2]], desc=f"Epoch {epoch+1}/{epochs}"):
-            # 1. 加载图像和标定
-            img_list, calib_list, ego_pose_mat = load_sample_data(sample_token)
-            # 转换为 (1, 6, 3, H, W) 格式
-            images = np.stack([img.transpose(2,0,1) for img in img_list if img is not None], axis=0)  # (6,3,H,W)
-            # 添加 batch 维度
-            images = images[None, ...]  # (1,6,3,H,W)
-            # 如果某个相机缺失，用零填充（但 sample 中应都有）
-            # 调整顺序与 CAMERAS 一致
-            # 略
-
-            # 2. 获取几何索引
-            geom_indices = geom_indices_cache[sample_token]
+        lr = cosine_annealing(epoch,epochs,lr_init=lr_init,lr_min=1e-9) 
+        for sample in tqdm([samples[2]], desc=f"Epoch {epoch+1}/{epochs}"):
+            images=sample['images']
+            geom_indices = sample['geom_indices']
             # 3. 前向
             heatmap, reg, depth_logits_list, bev_feat, caches = bev_forward(
                 images, geom_indices, BEV_SIZE, model_params
             )
-
-            # 4. 获取标注
-            anns = get_annotations(sample_token)
-
+            show_pred(heatmap,reg,depth_logits_list)
             # 5. 生成 GT
-            heatmap_gt = generate_heatmap_gt(anns, ego_pose_mat, BEV_SIZE, sigma=3.0)
-            reg_gt = generate_reg_gt(anns, ego_pose_mat, BEV_SIZE)
-#depth_gt = generate_depth_gt(sample_token, Hf, Wf)
-            depth_gt=generate_depth_gt(sample_token, DATA_ROOT, Hf, Wf, depth_bins=41, depth_range=(4.0, 45.0))
+            heatmap_gt = sample['hm']
+			# 将heatmap_gt 显示为3D
+            #generate_inline_html(sigmoid(heatmap),output_html = 'view_heatmap_infer.html')
+            #save_bev_heatmap(heatmap, heatmap_gt, epoch, save_dir='bev_vis')
+            save_all_class_heatmaps(heatmap, heatmap_gt, epoch, save_dir='bev_vis', num_cols=4)
+            reg_gt = sample['reg']
+            depth_gt=sample['depth']
+
             # 6. 堆叠深度 logits（取第一个相机，仅前摄像头）
             #depth_logits_batch = depth_logits_list[0][None, ...]  # (1, D, Hf, Wf)
             depth_logits_batch = np.stack(depth_logits_list,axis=0)[None,...]
+
             # 7. 损失计算（加权）
  
             losses, loss_caches = compute_losses(
                 heatmap, reg, heatmap_gt, reg_gt,
                 depth_logits_batch, depth_gt,
-                hm_weight=hm_weight, reg_weight=reg_weight, depth_weight=depth_weight
+                hm_weight=hm_weight, reg_weight=reg_weight, depth_weight=depth_weight,
+                hm_alpha = alphas,hm_gamma=2.0
             )
             total_loss += losses['total_loss']
 
             # 8. 梯度
             dheatmap, dreg, ddepth = d_compute_losses(
                 heatmap, reg, heatmap_gt, reg_gt,
-                depth_logits_batch, depth_gt, loss_caches,hm_weight=hm_weight,reg_weight = reg_weight,depth_weight=1.0)
+                depth_logits_batch, depth_gt, loss_caches,hm_weight=hm_weight,reg_weight = reg_weight,depth_weight=depth_weight,
+                hm_alpha = alphas,hm_gamma=2.0
+            )
 
             # 9. 构建深度梯度列表（每个相机）
             ddepth_per_cam = [None] * 6
@@ -593,11 +816,25 @@ def main():
                 dheatmap, dreg, ddepth_per_cam,
                 caches, model_params, geom_indices, BEV_SIZE
             )
-
+            grads = clip_grad_norm(grads,max_norm=1.0)
+			# 假设 total_loss 是当前 epoch 的总损失（您代码中是单样本的 total_loss）
+            if total_loss < best_loss:
+                best_loss = total_loss
+                np.savez_compressed(
+                    BEST_MODEL_PATH,
+                    model_params=model_params,
+                    m=m,
+                    v=v,
+                    step=step,
+                    epoch=epoch,
+                    lr = lr,
+                    best_loss=best_loss
+                )
+                print(f"⭐ 保存最佳模型 (epoch {epoch})，损失 {best_loss:.6f}")
             # 11. 更新
             model_params, m, v, step = adam_update(model_params, grads, lr, step, m, v)
         if (epoch+1) % 1 == 0:
-            print(f"Epoch {epoch:3d}, total: {losses['total_loss']:.6f},hm:{losses['loss_heatmap']:.6f},reg:{losses['loss_reg']:.6f},depth:{losses['loss_depth']:.6f}")
+            print(f"Epoch {epoch:3d},lr : {lr} total: {losses['total_loss']:.6f},hm:{losses['loss_heatmap']:.6f},reg:{losses['loss_reg']:.6f},depth:{losses['loss_depth']:.6f}")
 
 #        avg_loss = total_loss / len(sample_tokens)
 #        print(f"Epoch {epoch+1}/{epochs}, avg loss: {avg_loss:.4f}")
