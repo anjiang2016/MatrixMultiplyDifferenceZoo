@@ -327,6 +327,60 @@ def d_avgpool(dout, cache):
     
     return dx
 
+def d_avgpool_f(dout, cache):
+    """
+    平均池化的反向传播（向量化版本）
+    cache 应为 (input_shape, kernel_size, stride, padding)
+    input_shape: (B, C, H_in, W_in)
+    """
+    x_shape, k, s, pad,_,_,_ = cache
+    B, C, H_out, W_out = dout.shape
+    H_in, W_in = x_shape[2], x_shape[3]
+    
+    # 初始化梯度数组
+    dx = np.zeros((B, C, H_in, W_in), dtype=dout.dtype)
+    
+    # 1. 生成输出位置网格
+    h_out = np.arange(H_out)
+    w_out = np.arange(W_out)
+    
+    # 2. 计算每个输出窗口的起始位置（考虑 padding）
+    h_start = h_out[:, None] * s - pad   # (H_out, 1)
+    w_start = w_out[None, :] * s - pad   # (1, W_out)
+    
+    # 3. 生成窗口内偏移
+    h_off = np.arange(k)
+    w_off = np.arange(k)
+    
+    # 4. 生成所有输入索引 (H_out, W_out, k, k)
+    h_idx = h_start[..., None, None] + h_off[None, None, :, None]  # (H_out, W_out, k, 1)
+    w_idx = w_start[..., None, None] + w_off[None, None, None, :]  # (H_out, W_out, 1, k)
+    h_idx = np.broadcast_to(h_idx, (H_out, W_out, k, k))
+    w_idx = np.broadcast_to(w_idx, (H_out, W_out, k, k))
+    
+    # 5. 筛选有效位置（边界裁剪）
+    valid = (h_idx >= 0) & (h_idx < H_in) & (w_idx >= 0) & (w_idx < W_in)
+    valid_flat = valid.reshape(-1)
+    
+    # 6. 展平有效索引
+    h_flat = h_idx.reshape(-1)[valid_flat]
+    w_flat = w_idx.reshape(-1)[valid_flat]
+    
+    # 7. 对应的输出位置线性索引（用于取出 dout 值）
+    out_idx = np.arange(H_out * W_out).reshape(H_out, W_out, 1, 1)
+    out_idx = np.broadcast_to(out_idx, (H_out, W_out, k, k)).reshape(-1)[valid_flat]
+    
+    # 8. 对每个 batch 和 channel 进行累加（避免超大索引）
+    for b in range(B):
+        for c in range(C):
+            # 取出该层对应的输出梯度（展平）
+            dout_bc = dout[b, c].reshape(-1)  # (H_out*W_out,)
+            # 每个窗口的有效像素数（用于平均）——这里固定为 k*k，因为前向平均时包括填充
+            vals = dout_bc[out_idx] / (k * k)
+            # 累加到 dx 的对应位置
+            np.add.at(dx[b, c], (h_flat, w_flat), vals)
+    
+    return dx
 
 def avgpool_fast(x, kernel_size, stride=None, padding=0):
     """
