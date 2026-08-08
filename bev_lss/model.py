@@ -2,8 +2,9 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
+import time
 from funcs import (
-    conv, d_conv, silu, d_silu, avgpool, d_avgpool,
+    conv, d_conv, silu, d_silu, avgpool, d_avgpool,d_avgpool_f,
     softmax, d_softmax, sigmoid, linear, d_linear
 )
 
@@ -26,11 +27,15 @@ def resnet_stem(x, params):
 def d_resnet_stem(dout, cache, params):
     x, out_conv, out_relu, out_pool,avg_cache = cache
     # avgpool 反向
-    d_pool = d_avgpool(dout, avg_cache)
+    t0=time.perf_counter()
+    d_pool = d_avgpool_f(dout, avg_cache)
+    #print(f" d_avgpool {time.perf_counter()-t0:.3f}s")
     # relu 反向
     d_relu_out = d_silu(d_pool, out_relu)
     # conv 反向
+    t0=time.perf_counter()
     dx, dw, db = d_conv(d_relu_out, x, params['conv1_w'], stride=2, padding=3)
+    #print(f" d_conv {time.perf_counter()-t0:.3f}s")
     grads = {'conv1_w': dw, 'conv1_b': db}
     return dx, grads
 
@@ -106,7 +111,7 @@ def d_resnet18_features(dout, caches, params):
         # 如果该 stage 有下采样（stage < 3），前向有 avgpool，反向需先上采样
         if stage < 3:
             avg_cache = avg_caches[stage]
-            dx = d_avgpool(dx,avg_cache)
+            dx = d_avgpool_f(dx,avg_cache)
         stage_caches = caches[f'stage{stage}']  # list
         # 块反向
         for block_idx in range(len(stage_caches)-1, -1, -1):
@@ -120,7 +125,9 @@ def d_resnet18_features(dout, caches, params):
                 else:
                     grads[k] += v
     # stem 反向
+    t0 = time.perf_counter()
     dx_stem, stem_grads = d_resnet_stem(dx, caches['stem'], params['stem'])
+    #print(f"d_resnet_stem : {time.perf_counter() - t0:.3f}s")
     grads.update(stem_grads)
     return dx_stem, grads
 
@@ -175,17 +182,20 @@ def bev_pool(lift_feat, geom_indices, bev_shape):
     geom_indices: (N,) 一维网格索引
     bev_shape: (X, Y)
     """
+    valid_mask = geom_indices >=0
+    geom_indices0 = geom_indices[valid_mask]
     B, D, C_ctx, H, W = lift_feat.shape
     N = D * H * W
     lift_flat = lift_feat.reshape(B, N, C_ctx)
+    lift_flat0 = lift_flat[:,valid_mask,:]
     X, Y = bev_shape
     bev_list = []
     for b in range(B):
-        feat = lift_flat[b]
+        feat = lift_flat0[b]
         # 按网格索引排序
-        order = np.argsort(geom_indices)
+        order = np.argsort(geom_indices0)
         sorted_feat = feat[order]
-        sorted_idx = geom_indices[order]
+        sorted_idx = geom_indices0[order]
         # 获取唯一网格和每个网格的点数
         unique_idx, counts = np.unique(sorted_idx, return_counts=True)
         # 计算累积和（cumsum trick）
@@ -224,16 +234,19 @@ def d_bev_pool(dout_bev, lift_feat, geom_indices, bev_shape):
     bev_shape: (X, Y)
     返回: (B, D, C_ctx, H, W)
     """
+    valid_mask = geom_indices>=0
+    geom_indices0 = geom_indices[valid_mask]
     B, C_ctx, X, Y = dout_bev.shape
     B, D, C_ctx, H, W = lift_feat.shape
     N = D * H * W
     dout_flat = dout_bev.reshape(B, C_ctx, -1).transpose(0, 2, 1)  # (B, X*Y, C)
     d_lift_flat = np.zeros((B, N, C_ctx), dtype=np.float32)
     for b in range(B):
-        for grid_idx in range(X * Y):
-            mask = geom_indices == grid_idx
-            if np.any(mask):
-                d_lift_flat[b, mask] = dout_flat[b, grid_idx]
+        #for grid_idx in range(X * Y):
+            #mask = geom_indices0 == grid_idx
+            #if np.any(mask):
+            #    d_lift_flat[b, mask] = dout_flat[b, grid_idx]
+        d_lift_flat[b,valid_mask] = dout_flat[b,geom_indices0]
     d_lift = d_lift_flat.reshape(B, D, H, W, C_ctx).transpose(0, 1, 4, 2, 3)
     return d_lift
 
@@ -295,7 +308,7 @@ def centernet_head(bev_feat, head_params):
     reg, _, _ = conv(bev_feat, head_params['reg_w'], head_params['reg_b'], stride=1, padding=1)
     return heatmap, reg
 
-def d_centernet_head(dheatmap, dreg, bev_feat, head_params):
+def d_centernet_head(dheatmap, dreg, reg,bev_feat, head_params):
     """
     dheatmap: (B, num_classes, X, Y)
     dreg: (B, 8, X, Y)
@@ -303,6 +316,7 @@ def d_centernet_head(dheatmap, dreg, bev_feat, head_params):
     head_params: 参数字典
     返回: dbev, grads 字典
     """
+    #dreg_conv = (1 - reg**2)*dreg 
     dbev_hm, dw_hm, db_hm = d_conv(dheatmap, bev_feat, head_params['heatmap_w'], stride=1, padding=1)
     dbev_reg, dw_reg, db_reg = d_conv(dreg, bev_feat, head_params['reg_w'], stride=1, padding=1)
     dbev = dbev_hm + dbev_reg
@@ -316,6 +330,100 @@ def d_centernet_head(dheatmap, dreg, bev_feat, head_params):
 # 6. 损失函数及其梯度
 # ============================
 def focal_loss(heatmap_pred, heatmap_gt, alpha=0.25, gamma=2.0):
+    """
+    软标签 Focal Loss，适用于 heatmap_gt 为连续值 [0,1]
+    """
+    pred = sigmoid(heatmap_pred)+1e-12
+    #pred = np.clip(pred, 1e-7, 1 - 1e-7)
+
+    pos_weight = heatmap_gt           # 正样本权重
+    neg_weight = 1 - heatmap_gt       # 负样本权重
+
+    # 处理 alpha（支持标量或每类数组）
+    if np.isscalar(alpha):
+        alpha_pos = alpha
+        alpha_neg = 1 - alpha
+    else:
+        # alpha 应为 (num_classes,) 数组
+        alpha_pos = alpha[None, :, None, None]   # (1, C, 1, 1)
+        alpha_neg = 1 - alpha_pos
+
+    # 正样本损失（聚焦因子 (1-pred)^gamma）
+    loss_pos = -alpha_pos * (1 - pred) ** gamma * np.log(pred) * pos_weight
+    # 负样本损失（聚焦因子 pred^gamma）
+    loss_neg = -alpha_neg * pred ** gamma * np.log(1 - pred) * neg_weight
+
+    loss = loss_pos + loss_neg
+    return np.mean(loss)
+
+def d_focal_loss(heatmap_pred, heatmap_gt, alpha=0.25, gamma=2.0):
+    """
+    软标签 Focal Loss 的梯度
+    """
+    pred = sigmoid(heatmap_pred)+1e-12
+    #pred = np.clip(pred, 1e-7, 1 - 1e-7)
+    pos_weight = heatmap_gt
+    neg_weight = 1 - heatmap_gt
+
+    if np.isscalar(alpha):
+        alpha_pos = alpha
+        alpha_neg = 1 - alpha
+    else:
+        alpha_pos = alpha[None, :, None, None]
+        alpha_neg = 1 - alpha_pos
+
+    # 计算梯度（对 logits 求导）
+    # 对 loss_pos: d/dx = -alpha_pos * (1-pred)^gamma * (gamma * pred * log(pred) + pred - 1)
+    # 对 loss_neg: d/dx = -alpha_neg * pred^gamma * (gamma * (1-pred) * log(1-pred) + (1-pred) - 1)
+    # 但我们采用更稳定的数值方式：
+    grad_pos = -alpha_pos * (1 - pred) ** gamma * (gamma * pred * np.log(pred + 1e-8) + pred - 1)*-1.0
+    grad_neg = -alpha_neg * pred ** gamma * (gamma * (1 - pred) * np.log(1 - pred + 1e-8) + (1 - pred) - 1)
+
+    grad = grad_pos * pos_weight + grad_neg * neg_weight
+    return grad
+def focal_loss_hard(heatmap_pred, heatmap_gt, alpha=0.25, gamma=2.0):
+    """
+    heatmap_pred: (B, num_classes, H, W) logits
+    heatmap_gt: (B, num_classes, H, W) 二值标签（0/1）
+    alpha: 标量或形状为 (num_classes,) 的数组
+    gamma: 聚焦参数
+    """
+    pred = sigmoid(heatmap_pred)
+    pred = np.clip(pred, 1e-7, 1 - 1e-7)
+    pos_mask = (heatmap_gt == 1).astype(np.float32)
+    neg_mask = (heatmap_gt == 0).astype(np.float32)
+
+    if np.isscalar(alpha):
+        alpha_t = alpha * pos_mask + (1 - alpha) * neg_mask
+    else:
+        # alpha 应为 (num_classes,) 数组
+        alpha_pos = alpha[None, :, None, None]  # (1, C, 1, 1)
+        alpha_t = alpha_pos * pos_mask + (1 - alpha_pos) * neg_mask
+
+    p_t = pred * pos_mask + (1 - pred) * neg_mask
+    loss = -alpha_t * (1 - p_t) ** gamma * np.log(p_t + 1e-8)
+    return np.mean(loss)
+def d_focal_loss_hard(heatmap_pred, heatmap_gt, alpha=0.25, gamma=2.0):
+    """
+    返回损失对 lheatmap_pred 的梯度
+    """
+    pred = sigmoid(heatmap_pred)
+    pred = np.clip(pred, 1e-7, 1 - 1e-7)
+    pos_mask = (heatmap_gt == 1).astype(np.float32)
+    neg_mask = (heatmap_gt == 0).astype(np.float32)
+
+    if np.isscalar(alpha):
+        alpha_t = alpha * pos_mask + (1 - alpha) * neg_mask
+    else:
+        alpha_pos = alpha[None, :, None, None]
+        alpha_t = alpha_pos * pos_mask + (1 - alpha_pos) * neg_mask
+
+    p_t = pred * pos_mask + (1 - pred) * neg_mask
+    # 梯度公式：dL/dx = -alpha_t * (1-p_t)^gamma * (gamma * p_t * log(p_t) + p_t - 1) * (2*pos_mask - 1)
+    grad = -alpha_t * (1 - p_t) ** gamma * (gamma * p_t * np.log(p_t + 1e-8) + p_t - 1) * (2 * pos_mask - 1)
+    grad = np.clip(grad, -10.0, 10.0)
+    return grad
+def focal_loss1(heatmap_pred, heatmap_gt, alpha=0.25, gamma=2.0):
     """
     标准 Focal Loss（二分类）
     heatmap_gt: (B, C, H, W) 二值标签（0或1）
@@ -332,7 +440,7 @@ def focal_loss(heatmap_pred, heatmap_gt, alpha=0.25, gamma=2.0):
     loss = -alpha_t * (1 - p_t) ** gamma * np.log(p_t + 1e-8)
     return np.mean(loss)
 
-def d_focal_loss(heatmap_pred, heatmap_gt, alpha=0.25, gamma=2.0):
+def d_focal_loss1(heatmap_pred, heatmap_gt, alpha=0.25, gamma=2.0):
     pred = sigmoid(heatmap_pred)
     pred = np.clip(pred, 1e-7, 1 - 1e-7)
     pos_mask = (heatmap_gt == 1).astype(np.float32)
@@ -371,8 +479,60 @@ def d_focal_loss_(heatmap_pred, heatmap_gt, alpha=2.0, beta=4.0):
     grad_neg = pred ** alpha * (alpha * (1 - pred) * np.log(1 - pred + 1e-6) - pred) * (1 - heatmap_gt) ** beta
     grad = pos_mask * grad_pos + neg_mask * grad_neg
     return grad
+def reg_l1_loss(reg_pred, reg_gt, heatmap_gt, beta=1.0):
+    """
+    Smooth L1 loss for regression.
+    Args:
+        reg_pred: (B, 8, X, Y)
+        reg_gt: (B, 8, X, Y)
+        heatmap_gt: (B, num_classes, X, Y) 用于确定有效位置
+        beta: 平滑阈值，默认1.0
+    Returns:
+        scalar loss
+    """
+    #import pdb;pdb.set_trace()
+    #pos_mask = np.sum(heatmap_gt, axis=1) > 0  # (B, X, Y)
+    pos_mask = (reg_gt[:,2,:,:] !=0)
+    if not np.any(pos_mask):
+        return 0.0
+
+    pos_mask_expanded = np.repeat(pos_mask[:, None, :, :], reg_pred.shape[1], axis=1)
+    diff = reg_pred[pos_mask_expanded] - reg_gt[pos_mask_expanded]
+    
+    # Smooth L1
+    abs_diff = np.abs(diff)
+    print(abs_diff[abs_diff>1])
+    print(np.abs(abs_diff[abs_diff>1]).mean())
+    loss = np.where(abs_diff < beta,
+                    0.5 * diff**2 / beta,
+                    abs_diff - 0.5 * beta)
+    return np.mean(loss)
+def d_reg_l1_loss(reg_pred, reg_gt, heatmap_gt, beta=1.0):
+    """
+    Gradient of Smooth L1 loss w.r.t. reg_pred.
+    Returns gradient of shape same as reg_pred.
+    """
+    #pos_mask = np.sum(heatmap_gt, axis=1) > 0
+    pos_mask = (reg_gt[:,2,:,:] !=0)
+    grad = np.zeros_like(reg_pred)
+    if not np.any(pos_mask):
+        return grad
+
+    pos_mask_expanded = np.repeat(pos_mask[:, None, :, :], reg_pred.shape[1], axis=1)
+    diff = reg_pred[pos_mask_expanded] - reg_gt[pos_mask_expanded]
+    
+    # Gradient: x/beta if |x|<beta else sign(x)
+    abs_diff = np.abs(diff)
+    grad_val = np.where(abs_diff < beta,
+                        diff / beta,
+                        np.sign(diff))
+    
+    # 除以总元素数以匹配 loss 的 mean
+    n = np.sum(pos_mask_expanded)
+    grad[pos_mask_expanded] = grad_val / n
+    return grad
 # 修改 reg_l1_loss 和 d_reg_l1_loss
-def reg_l1_loss(reg_pred, reg_gt, heatmap_gt):
+def reg_l1_loss_(reg_pred, reg_gt, heatmap_gt):
     # heatmap_gt: (B, num_classes, X, Y)
     pos_mask = np.sum(heatmap_gt, axis=1) > 0  # (B, X, Y)
     if np.sum(pos_mask) == 0:
@@ -380,16 +540,20 @@ def reg_l1_loss(reg_pred, reg_gt, heatmap_gt):
     # 扩展掩码到 (B, 8, X, Y)
 #print(pos_mask.sum())
     pos_mask_expanded = np.repeat(pos_mask[:, None, :, :], reg_pred.shape[1], axis=1)  # (B, 8, X, Y)
-#print(reg_pred[pos_mask_expanded] - reg_gt[pos_mask_expanded])
+    reg_diff=reg_pred[pos_mask_expanded] - reg_gt[pos_mask_expanded]
+    reg_diff_abs = np.abs(reg_diff)
+    print(reg_diff[reg_diff_abs>1])
+    print(np.abs(reg_diff[reg_diff_abs>1]).max())
     return np.mean(np.abs(reg_pred[pos_mask_expanded] - reg_gt[pos_mask_expanded]))
 
-def d_reg_l1_loss(reg_pred, reg_gt, heatmap_gt):
+def d_reg_l1_loss_(reg_pred, reg_gt, heatmap_gt):
     pos_mask = np.sum(heatmap_gt, axis=1) > 0
     grad = np.zeros_like(reg_pred)
     if np.sum(pos_mask) == 0:
         return grad
     pos_mask_expanded = np.repeat(pos_mask[:, None, :, :], reg_pred.shape[1], axis=1)
-    grad[pos_mask_expanded] = np.sign(reg_pred[pos_mask_expanded] - reg_gt[pos_mask_expanded]) / np.sum(pos_mask)
+    n = np.sum(pos_mask_expanded)
+    grad[pos_mask_expanded] = np.sign(reg_pred[pos_mask_expanded] - reg_gt[pos_mask_expanded]) / n
     return grad
 def depth_loss(depth_pred, depth_gt):
     """
@@ -486,8 +650,8 @@ def d_depth_loss1(depth_pred, depth_gt, cache=None):
     grad = grad_flat.reshape(B, H, W, D).transpose(0, 3, 1, 2)
     return grad
 def compute_losses(heatmap_pred, reg_pred, heatmap_gt, reg_gt, depth_pred=None, depth_gt=None,
-                   hm_weight=1.0, reg_weight=1.0, depth_weight=1.0):
-    loss_hm = hm_weight * focal_loss(heatmap_pred, heatmap_gt)
+                   hm_weight=1.0, reg_weight=1.0, depth_weight=1.0,hm_alpha=0.25, hm_gamma=2.0):
+    loss_hm = hm_weight * focal_loss(heatmap_pred, heatmap_gt,alpha=hm_alpha,gamma=hm_gamma)
     loss_reg = reg_weight * reg_l1_loss(reg_pred, reg_gt, heatmap_gt)
     depth_cache = None
     if depth_pred is not None and depth_gt is not None:
@@ -500,15 +664,18 @@ def compute_losses(heatmap_pred, reg_pred, heatmap_gt, reg_gt, depth_pred=None, 
     return {'loss_heatmap': loss_hm, 'loss_reg': loss_reg, 'loss_depth': loss_depth, 'total_loss': total}, caches
 def d_compute_losses(heatmap_pred, reg_pred, heatmap_gt, reg_gt,
                      depth_pred=None, depth_gt=None, caches=None,
-                     hm_weight=1.0, reg_weight=1.0, depth_weight=1.0):
+                     hm_weight=1.0, reg_weight=1.0, depth_weight=1.0,hm_alpha=0.25,hm_gamma=2.0):
     # 梯度需要乘以对应的权重
-    dheatmap = d_focal_loss(heatmap_pred, heatmap_gt) * hm_weight
+    dheatmap = d_focal_loss(heatmap_pred, heatmap_gt,alpha = hm_alpha, gamma=hm_gamma) * hm_weight
     dreg = d_reg_l1_loss(reg_pred, reg_gt, heatmap_gt) * reg_weight
-    ddepth = None
     if depth_pred is not None and depth_gt is not None:
         depth_cache = caches.get('depth') if caches else None
         ddepth = d_depth_loss(depth_pred, depth_gt, depth_cache)
         ddepth *= depth_weight
+    mean_abs_hm = np.mean(np.abs(dheatmap))
+    mean_abs_reg = np.mean(np.abs(dreg))
+    mean_abs_depth = np.mean(np.abs(ddepth))
+    print(f"Mean abs grad: HM={mean_abs_hm:.6e}, REG={mean_abs_reg:.6e}, DEPTH = {mean_abs_depth:.6e}")
     return dheatmap, dreg, ddepth
 # ============================
 # 7. 完整 BEV 模型
@@ -530,7 +697,9 @@ def bev_forward(images, geom_indices_list, bev_shape, model_params):
     for b in range(B):
         for n in range(N):
             img = images[b, n]
+            t0 = time.perf_counter()
             feat, cache = resnet18_features(img[None, ...], model_params['backbone'])
+            #print(f"resnet18 time: {time.perf_counter()-t0:.3f}s")
             feat_list.append(feat)
             backbone_caches.append(cache)
     features = np.stack(feat_list, axis=0).reshape(B, N, feat.shape[1], feat.shape[2], feat.shape[3])
@@ -555,6 +724,7 @@ def bev_forward(images, geom_indices_list, bev_shape, model_params):
     bev_acc = np.zeros((B, lift_feats.shape[2], bev_shape[0], bev_shape[1]), dtype=np.float32)
     for b in range(B):
         for n in range(N):
+        #for n in [0,3]:
             idx = b * N + n
             geom_idx = geom_indices_list[b][n]
             lift_feat = lift_feats[idx]
@@ -591,7 +761,8 @@ def bev_backward(dheatmap, dreg, ddepth_list, caches, model_params, geom_indices
     # 1. 检测头反向
     bev_feat = caches['bev_feat']
     head_params = model_params['head']
-    dbev, head_grads = d_centernet_head(dheatmap, dreg, bev_feat, head_params)
+    reg = caches['reg']
+    dbev, head_grads = d_centernet_head(dheatmap, dreg, reg,bev_feat, head_params)
     grads['head'] = head_grads
 
     # 2. BEV 编码器反向
@@ -599,7 +770,6 @@ def bev_backward(dheatmap, dreg, ddepth_list, caches, model_params, geom_indices
     bev_enc_params = model_params['bev_encoder']
     dbev_enc_in, bev_enc_grads = d_bev_encoder(dbev, bev_encoder_caches, bev_enc_params)
     grads['bev_encoder'] = bev_enc_grads
-
     # 3. BEV Pooling 反向
     # 将 dbev_enc_in (B,C,X,Y) 复制到每个相机
     dbev_per_cam = np.repeat(dbev_enc_in[:, None, :, :, :], N, axis=1)  # (B,N,C,X,Y)
@@ -663,13 +833,16 @@ def bev_backward(dheatmap, dreg, ddepth_list, caches, model_params, geom_indices
     grads['lift_depth'] = grads_lift_depth
     grads['lift_context'] = grads_lift_context
 
+    import time
     # 5. Backbone 反向
     backbone_caches = caches['backbone_caches']  # list of dicts
     dfeatures_flat = dfeatures_total.reshape(-1, *dfeatures_total.shape[2:])  # (B*N, Cf, Hf, Wf)
     backbone_grads = {}
     for i, cache in enumerate(backbone_caches):
         dfeat = dfeatures_flat[i][None, ...]
+        t0 = time.perf_counter()
         _, grad_i = d_resnet18_features(dfeat, cache, model_params['backbone'])
+        #print(f"d_resnet18 time: {time.perf_counter()-t0:.3f}s")
         for k, v in grad_i.items():
             if k not in backbone_grads:
                 backbone_grads[k] = v
@@ -705,13 +878,13 @@ def init_linear_weight(in_dim, out_dim, gain=1.0):
 def init_model_params(backbone_in=3, backbone_out=512,
                       depth_bins=41, context_channels=64,
                       bev_channels=64, bev_shape=(200,200),
-                      num_classes=10):
+                      num_classes=10,global_gain=0.4):
     params = {}
     # Backbone (仅定义所需层)
     params['backbone'] = {}
     # stem
     params['backbone']['stem'] = {
-        'conv1_w': init_conv_weight((64, backbone_in, 7, 7), gain=np.sqrt(2)),
+        'conv1_w': init_conv_weight((64, backbone_in, 7, 7), gain=global_gain),
         'conv1_b': np.zeros(64)
     }
     # stages
@@ -719,25 +892,25 @@ def init_model_params(backbone_in=3, backbone_out=512,
         C = 64  # 保持所有阶段通道数为 64
         for block in range(2):
             params['backbone'][f'stage{stage}'] = {
-                'conv1_w': init_conv_weight((C, C, 3, 3), gain=np.sqrt(2)),
+                'conv1_w': init_conv_weight((C, C, 3, 3), gain=global_gain),
                 'conv1_b': np.zeros(C),
-                'conv2_w': init_conv_weight((C, C, 3, 3), gain=np.sqrt(2)),
+                'conv2_w': init_conv_weight((C, C, 3, 3), gain=global_gain),
                 'conv2_b': np.zeros(C)
             }
     # Lift 输入通道改为 64
     params['lift_depth'] = {
-        'w': init_conv_weight((depth_bins, backbone_out, 3, 3), gain=np.sqrt(2)),
+        'w': init_conv_weight((depth_bins, backbone_out, 3, 3), gain=global_gain),
         'b': np.zeros(depth_bins)
     }
     params['lift_context'] = {
-        'w': init_conv_weight((context_channels, backbone_out, 3, 3), gain=np.sqrt(2)),
+        'w': init_conv_weight((context_channels, backbone_out, 3, 3), gain=global_gain),
         'b': np.zeros(context_channels)
     }
     # BEV encoder
     params['bev_encoder'] = {
         'weights': [
-            init_conv_weight((bev_channels, context_channels, 3, 3), gain=np.sqrt(2)),
-            init_conv_weight((bev_channels, bev_channels, 3, 3), gain=np.sqrt(2))
+            init_conv_weight((bev_channels, context_channels, 3, 3), gain=global_gain),
+            init_conv_weight((bev_channels, bev_channels, 3, 3), gain=global_gain)
         ],
         'biases': [np.zeros(bev_channels), np.zeros(bev_channels)]
     }
@@ -745,7 +918,7 @@ def init_model_params(backbone_in=3, backbone_out=512,
     params['head'] = {
         'heatmap_w': init_conv_weight((num_classes, bev_channels, 3, 3), gain=1.0),
         'heatmap_b': np.zeros(num_classes),
-        'reg_w': init_conv_weight((8, bev_channels, 3, 3), gain=1.0),
+        'reg_w': init_conv_weight((8, bev_channels, 3, 3), gain=1.4),
         'reg_b': np.zeros(8)
     }
     return params
