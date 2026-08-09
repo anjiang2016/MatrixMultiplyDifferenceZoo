@@ -202,7 +202,147 @@ def d_sigmoid(x, y=None):
     else:
         s = sigmoid(x)
         return s * (1 - s)
+# ========== 最大池化（快速版本） ==========
+def maxpool(x, kernel_size, stride=None, padding=0):
+    """
+    最大池化前向传播（快速版本，使用 as_strided）
 
+    Args:
+        x: (N, C, H, W) 输入
+        kernel_size: int 或 tuple (Hk, Wk)
+        stride: int 或 tuple，默认等于 kernel_size
+        padding: int 或 tuple
+
+    Returns:
+        out: (N, C, H_out, W_out) 池化后的输出
+        cache: (x_shape, kernel_size, stride, padding, argmax_index, H_out, W_out)
+               用于反向传播
+    """
+    N, C, H, W = x.shape
+
+    if isinstance(kernel_size, int):
+        Hk = Wk = kernel_size
+    else:
+        Hk, Wk = kernel_size
+
+    if stride is None:
+        stride_h = stride_w = Hk
+    elif isinstance(stride, int):
+        stride_h = stride_w = stride
+    else:
+        stride_h, stride_w = stride
+
+    if isinstance(padding, int):
+        pad_h = pad_w = padding
+    else:
+        pad_h, pad_w = padding
+
+    # Padding
+    x_pad = np.pad(x, ((0, 0), (0, 0), (pad_h, pad_h), (pad_w, pad_w)),
+                   mode='constant', constant_values=0)
+
+    # 输出尺寸
+    H_out = (H + 2 * pad_h - Hk) // stride_h + 1
+    W_out = (W + 2 * pad_w - Wk) // stride_w + 1
+
+    # 使用 as_strided 构建窗口视图
+    shape = (N, C, H_out, W_out, Hk, Wk)
+    strides = (
+        x_pad.strides[0],
+        x_pad.strides[1],
+        x_pad.strides[2] * stride_h,
+        x_pad.strides[3] * stride_w,
+        x_pad.strides[2],
+        x_pad.strides[3]
+    )
+    windows = as_strided(x_pad, shape=shape, strides=strides)
+
+    # 展平最后两维 (Hk, Wk) 为 (Hk*Wk)
+    windows_flat = windows.reshape(N, C, H_out, W_out, Hk * Wk)
+
+    # 最大值和 argmax（在窗口维度上）
+    out = np.max(windows_flat, axis=-1)  # (N, C, H_out, W_out)
+    argmax_index = np.argmax(windows_flat, axis=-1)  # (N, C, H_out, W_out)
+
+    cache = (x.shape, kernel_size, stride, padding, argmax_index, H_out, W_out)
+    return out, cache
+
+
+def d_maxpool(dout, cache):
+    """
+    最大池化反向传播（快速版本，使用 np.add.at）
+
+    Args:
+        dout: (N, C, H_out, W_out) 上游梯度
+        cache: 前向传播缓存的 (x_shape, kernel_size, stride, padding, argmax_index, H_out, W_out)
+
+    Returns:
+        dx: (N, C, H, W) 输入梯度
+    """
+    x_shape, kernel_size, stride, padding, argmax_index, H_out, W_out = cache
+    N, C, H, W = x_shape
+
+    if isinstance(kernel_size, int):
+        Hk = Wk = kernel_size
+    else:
+        Hk, Wk = kernel_size
+
+    if stride is None:
+        stride_h = stride_w = Hk
+    elif isinstance(stride, int):
+        stride_h = stride_w = stride
+    else:
+        stride_h, stride_w = stride
+
+    if isinstance(padding, int):
+        pad_h = pad_w = padding
+    else:
+        pad_h, pad_w = padding
+
+    # 初始化 padding 后的梯度
+    dx_pad = np.zeros((N, C, H + 2 * pad_h, W + 2 * pad_w), dtype=dout.dtype)
+
+    # 生成输出位置索引
+    h_out = np.arange(H_out)
+    w_out = np.arange(W_out)
+    # 输出位置网格 (H_out, W_out)
+    h_out_grid, w_out_grid = np.meshgrid(h_out, w_out, indexing='ij')
+
+    # 计算每个输出位置对应的输入窗口起始坐标（考虑 padding）
+    h_start = h_out_grid * stride_h  # (H_out, W_out)
+    w_start = w_out_grid * stride_w
+
+    # 将 argmax 索引 (0 ~ Hk*Wk-1) 转为窗口内偏移 (h_off, w_off)
+    h_off = argmax_index // Wk  # (N, C, H_out, W_out)
+    w_off = argmax_index % Wk
+
+    # 计算全局输入坐标（在 padded 图像上）
+    h_idx = h_start[None, None, :, :] + h_off  # (N, C, H_out, W_out)
+    w_idx = w_start[None, None, :, :] + w_off
+
+    # 展平所有维度以用于 add.at
+    N_indices = np.arange(N)[:, None, None, None]
+    C_indices = np.arange(C)[None, :, None, None]
+    # 利用广播展开成与 h_idx 相同形状
+    # 注意：add.at 要求索引形状与值匹配，我们将其展平
+    flat_h = h_idx.ravel()
+    flat_w = w_idx.ravel()
+    flat_n = np.broadcast_to(N_indices, h_idx.shape).ravel()
+    flat_c = np.broadcast_to(C_indices, h_idx.shape).ravel()
+
+    # 展平 dout
+    flat_dout = dout.ravel()
+
+    # 使用 np.add.at 累加梯度
+    np.add.at(dx_pad, (flat_n, flat_c, flat_h, flat_w), flat_dout)
+
+    # 裁掉 padding
+    if pad_h > 0 or pad_w > 0:
+        dx = dx_pad[:, :, pad_h:-pad_h, pad_w:-pad_w]
+    else:
+        dx = dx_pad
+
+    return dx
 import numpy as np
 from numpy.lib.stride_tricks import as_strided
 
@@ -780,6 +920,126 @@ def d_dropout(dout, cache):
     # 梯度只通过训练时保留的神经元
     dx = dout * mask / keep_prob
     return dx
+# ========== Batch Normalization ==========
+def batch_norm(x, gamma, beta, eps=1e-5, momentum=0.9, training=True,
+               running_mean=None, running_var=None):
+    """
+    Batch Normalization 前向传播
+
+    Args:
+        x: (N, C, *) 输入，其中 * 为任意空间维度（例如 H, W 或空）
+        gamma: (C,) 缩放参数
+        beta: (C,) 平移参数
+        eps: float，数值稳定小量
+        momentum: float，指数移动平均的动量系数
+        training: bool，是否为训练模式（True 使用 batch 统计量，False 使用 running 统计量）
+        running_mean: (C,) 或 None，运行时均值（用于测试）
+        running_var: (C,) 或 None，运行时方差（用于测试）
+
+    Returns:
+        out: (N, C, *) 归一化后的输出
+        cache: 包含 (x, gamma, beta, eps, mean, var, x_hat, training, running_mean, running_var)
+               用于反向传播和更新 running 统计量
+
+    Notes:
+        - 在训练时，计算当前 batch 的均值和方差，并（可选）更新 running_mean/var
+        - 在测试时，使用提供的 running_mean/var；若未提供则使用 batch 统计量（警告）
+        - 对每个通道独立计算，归一化维度为除 C 以外的所有维度
+    """
+    # 确定需要归约的轴：除通道轴（axis=1）外的所有轴
+    # x.shape = (N, C, ...)
+    axis = tuple(i for i in range(x.ndim) if i != 1)
+    # 保持维度便于广播
+    keep_dims = True
+    broadcast_shape= [1]*x.ndim
+    broadcast_shape[1] = -1
+    if training:
+        # 计算当前 batch 的均值和方差
+        mean = np.mean(x, axis=axis, keepdims=keep_dims)
+        var = np.var(x, axis=axis, keepdims=keep_dims)
+        # 更新 running 统计量（如果提供了）
+        if running_mean is not None and running_var is not None:
+            # 注意：running_mean/var 是 (C,)，需保持维度一致
+            # 此处直接使用 squeeze 或 reshape
+            running_mean[:] = momentum * running_mean + (1 - momentum) * mean.squeeze(axis)
+            running_var[:] = momentum * running_var + (1 - momentum) * var.squeeze(axis)
+        # 归一化
+        x_hat = (x - mean) / np.sqrt(var + eps)
+    else:
+        # 测试模式：使用 running 统计量
+        if running_mean is None or running_var is None:
+            # 若未提供，回退到 batch 统计量（仅用于安全）
+            print("⚠️ batch_norm: running_mean/var not provided in test mode, using batch statistics")
+            mean = np.mean(x, axis=axis, keepdims=keep_dims)
+            var = np.var(x, axis=axis, keepdims=keep_dims)
+        else:
+            # 将 running_mean/var reshape 为 (1, C, 1, ...) 便于广播
+            mean = running_mean.reshape(shape)
+            var = running_var.reshape(shape)
+        x_hat = (x - mean) / np.sqrt(var + eps)
+
+    out = gamma.reshape(broadcast_shape) * x_hat + beta.reshape(broadcast_shape)
+
+    # 缓存用于反向传播（保存训练时的统计量，测试时反向一般不会调用）
+    cache = (x, gamma, beta, eps, mean, var, x_hat, training, running_mean, running_var, axis)
+    return out, cache
+
+
+def d_batch_norm(dout, cache):
+    """
+    Batch Normalization 反向传播
+
+    Args:
+        dout: (N, C, *) 上游梯度
+        cache: 前向传播的缓存 (x, gamma, beta, eps, mean, var, x_hat, training, running_mean, running_var, axis)
+
+    Returns:
+        dx: (N, C, *) 输入梯度
+        dgamma: (C,) gamma 梯度
+        dbeta: (C,) beta 梯度
+
+    Notes:
+        - 仅当 training=True 时反向传播正确；测试模式反向没有意义，但仍会返回
+        - 梯度公式参考 Batch Normalization 论文
+    """
+    x, gamma, beta, eps, mean, var, x_hat, training, running_mean, running_var, axis = cache
+
+    # 还原一些形状信息
+    N = x.shape[0]
+    # 计算归一化维度大小（即每个通道对应的元素个数）
+    # 可用 np.prod 计算，但要排除通道维度
+    reduce_size = np.prod([x.shape[i] for i in axis])
+
+    # 确保 mean, var 是 (1, C, 1, ...) 形状
+    # 若缓存里已经是 keepdims 形状，则直接使用
+    # 将 gamma 扩展为与 x 同形状
+    # 将 gamma 扩展为 broadcast 形状
+    broadcast_shape = [1] * x.ndim
+    broadcast_shape[1] = -1
+    gamma_reshape = gamma.reshape(broadcast_shape)
+
+    # 计算 dbeta, dgamma（求和除通道外的所有维度）
+    sum_axis = axis  # 与归约轴一致
+    dbeta = np.sum(dout, axis=sum_axis, keepdims=False)
+    dgamma = np.sum(dout * x_hat, axis=sum_axis, keepdims=False)
+
+    # 计算 dx
+    # 标准公式：
+    # dx = (1/N) * gamma / sqrt(var+eps) * ( N * dout - sum(dout) - x_hat * sum(dout * x_hat) )
+    # 其中 N = reduce_size
+    # 注意：dout 与 x_hat 同形状
+    # 需要保持 keepdims 以便广播
+    dout_sum = np.sum(dout, axis=axis, keepdims=True)
+    dout_x_hat_sum = np.sum(dout * x_hat, axis=axis, keepdims=True)
+
+    # 注意：gamma_reshape 的形状 (1, C, 1, ...)
+    inv_std = 1.0 / np.sqrt(var + eps)  # var 是 keepdims 形状
+
+    dx = (gamma_reshape / reduce_size) * inv_std * (
+        reduce_size * dout - dout_sum - x_hat * dout_x_hat_sum
+    )
+
+    return dx, dgamma, dbeta
 # ========== 内部实现 layer_norm 和 d_layer_norm ==========
 def layer_norm(x, gamma, beta, eps=1e-5, cache=None):
     """
