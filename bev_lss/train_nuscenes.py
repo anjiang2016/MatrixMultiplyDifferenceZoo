@@ -17,7 +17,7 @@ from funcs import sigmoid
 DATA_ROOT = "/Users/zhaomingming/data_sets/v1.0-mini"  # 修改为你的路径
 CAMERAS = ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT',
            'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
-BEV_RANGE = (-50, 50)          # 米
+BEV_RANGE = (-44, 44)          # 米
 BEV_RESOLUTION = 1.0           # 米/像素
 BEV_SIZE = (int((BEV_RANGE[1] - BEV_RANGE[0]) / BEV_RESOLUTION),
             int((BEV_RANGE[1] - BEV_RANGE[0]) / BEV_RESOLUTION))
@@ -318,12 +318,11 @@ def generate_heatmap_gt(anns, ego_pose_mat, bev_size, class_mapping, instance_to
         class_idx = class_mapping.get(cat_name)
         if class_idx is None:
             continue  # 忽略未映射的类别
-
         pos_global = np.array(ann['translation'])
         pos_ego = R_global2ego @ pos_global + t_global2ego
         x, y = pos_ego[0], pos_ego[1]  # 交换（与BEV映射对齐）
 
-        if x < BEV_RANGE[0] or x >= BEV_RANGE[1] or y < BEV_RANGE[0] or y >= BEV_RANGE[1]:
+        if x < BEV_RANGE[0]*0.8 or x >= BEV_RANGE[1]*0.8 or y < BEV_RANGE[0]*0.8 or y >= BEV_RANGE[1]*0.8:
             continue
 
         gx = int((x - BEV_RANGE[0]) / BEV_RESOLUTION)
@@ -374,7 +373,7 @@ def generate_reg_gt(anns, ego_pose_mat, bev_size):
         pos_global = np.array(ann['translation'])
         pos_ego = R_global2ego @ pos_global + t_global2ego
         x, y = pos_ego[0], pos_ego[1]
-        if x < BEV_RANGE[0] or x >= BEV_RANGE[1] or y < BEV_RANGE[0] or y >= BEV_RANGE[1]:
+        if x < BEV_RANGE[0]*0.8 or x >= BEV_RANGE[1]*0.8 or y < BEV_RANGE[0]*0.8 or y >= BEV_RANGE[1]*0.8:
             continue
         gx = int((x - BEV_RANGE[0]) / BEV_RESOLUTION)
         gy = int((y - BEV_RANGE[0]) / BEV_RESOLUTION)
@@ -688,7 +687,6 @@ def get_samples(sts,geom_indices_cache,instance_to_category,H,W,Hf,Wf):
         sm=get_sample_from_st(st,geom_indices_cache[st],instance_to_category,cat_name_map,H,W,Hf,Wf)
         sms.append(sm)
     return sms
-
 # ============================
 # 训练主循环
 # ============================
@@ -697,10 +695,10 @@ def main():
     # 初始化模型参数
     model_params = init_model_params(
         backbone_in=3,
-        backbone_out=64,
+        backbone_out=512,
         depth_bins=DEPTH_BINS,
-        context_channels=64,
-        bev_channels=64,
+        context_channels=128,
+        bev_channels=128,
         bev_shape=BEV_SIZE,
         num_classes=NUM_CLASSES
     )
@@ -741,11 +739,11 @@ def main():
         geom_indices_cache[token] = [build_geometry_indices(token, model_params, H, W, Hf, Wf)]
     samples = get_samples(sample_tokens,geom_indices_cache,instance_to_category,H,W,Hf,Wf)
     # 超参数
-    lr_init = 3e-4
-    epochs = 1000
-    hm_weight = 0.1
-    reg_weight =100.0
-    depth_weight =10.0 
+    lr_init = 3e-3
+    epochs = 100
+    hm_weight = 0.1*0.5
+    reg_weight =100.0*0
+    depth_weight =10.0*3.0*0
     # ---------- 尝试加载最佳模型 ----------
     best_loss = float('inf')
     start_epoch = 0
@@ -797,7 +795,7 @@ def main():
                 heatmap, reg, heatmap_gt, reg_gt,
                 depth_logits_batch, depth_gt,
                 hm_weight=hm_weight, reg_weight=reg_weight, depth_weight=depth_weight,
-                hm_alpha = alphas,hm_gamma=2.0
+                hm_alpha = alphas,hm_gamma=3.0
             )
             total_loss += losses['total_loss']
 
@@ -835,6 +833,8 @@ def main():
             model_params, m, v, step = adam_update(model_params, grads, lr, step, m, v)
         if (epoch+1) % 1 == 0:
             print(f"Epoch {epoch:3d},lr : {lr} total: {losses['total_loss']:.6f},hm:{losses['loss_heatmap']:.6f},reg:{losses['loss_reg']:.6f},depth:{losses['loss_depth']:.6f}")
+            print(model_params['bev_encoder']['enc1']['conv1_w'][:2,:2,...].flatten())
+            print(grads['bev_encoder']['enc1']['conv1_w'][:2,:2,...].flatten())
 
 #        avg_loss = total_loss / len(sample_tokens)
 #        print(f"Epoch {epoch+1}/{epochs}, avg loss: {avg_loss:.4f}")
