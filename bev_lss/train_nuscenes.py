@@ -767,7 +767,7 @@ def main():
     best_loss = float('inf')
     for epoch in range(start_epoch,epochs):
         total_loss = 0.0
-        lr = cosine_annealing(epoch,epochs,lr_init=lr_init,lr_min=1e-9) 
+        lr = cosine_annealing(epoch,epochs,lr_init=lr_init,lr_min=1e-4) 
         for sample in tqdm([samples[2]], desc=f"Epoch {epoch+1}/{epochs}"):
             images=sample['images']
             geom_indices = sample['geom_indices']
