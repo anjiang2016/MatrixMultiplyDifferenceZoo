@@ -5,13 +5,14 @@ import numpy as np
 import time
 from funcs import (
     conv, d_conv, silu, d_silu, avgpool, d_avgpool,d_avgpool_f,
-    softmax, d_softmax, sigmoid, linear, d_linear
+    softmax, d_softmax, sigmoid, linear, d_linear,batch_norm,d_batch_norm,
+    maxpool,d_maxpool,upsample_nearest,d_upsample_nearest
 )
 
 # ============================
 # 1. 图像特征提取（ResNet18 简化版）
 # ============================
-
+#Basic： Conv → BN → ReLU → Conv → BN → (Add) → ReLU
 def resnet_stem(x, params):
     """
     x: (B, 3, H, W)
@@ -19,26 +20,30 @@ def resnet_stem(x, params):
     返回: out (B,64,H/4,W/4), cache (x, out_conv, out_relu, out_pool)
     """
     out_conv, _, _ = conv(x, params['conv1_w'], params['conv1_b'], stride=2, padding=3)
-    out_relu = silu(out_conv)
-    out_pool, avg_cache = avgpool(out_relu, kernel_size=3, stride=2, padding=1)
-    cache = (x, out_conv, out_relu, out_pool,avg_cache)
+    out_bn,bn_cache= batch_norm(out_conv,params['gamma'],params['beta'],training=True)
+    out_relu = silu(out_bn)
+    out_pool, max_cache = maxpool(out_relu, kernel_size=3, stride=2, padding=1)
+    cache = (x, out_conv, bn_cache,out_relu, out_pool,max_cache)
     return out_pool, cache
 
 def d_resnet_stem(dout, cache, params):
-    x, out_conv, out_relu, out_pool,avg_cache = cache
+    x, out_conv, bn_cache, out_relu, out_pool,max_cache = cache
     # avgpool 反向
     t0=time.perf_counter()
-    d_pool = d_avgpool_f(dout, avg_cache)
+    d_pool = d_maxpool(dout, max_cache)
     #print(f" d_avgpool {time.perf_counter()-t0:.3f}s")
     # relu 反向
     d_relu_out = d_silu(d_pool, out_relu)
+    # bn 反向
+    dx, dgamma, dbeta = d_batch_norm(d_relu_out,bn_cache)
     # conv 反向
     t0=time.perf_counter()
     dx, dw, db = d_conv(d_relu_out, x, params['conv1_w'], stride=2, padding=3)
     #print(f" d_conv {time.perf_counter()-t0:.3f}s")
-    grads = {'conv1_w': dw, 'conv1_b': db}
+    grads = {'conv1_w': dw, 'conv1_b': db,'gamma':dgamma, 'beta':dbeta}
     return dx, grads
-
+#Bottleneck： Conv → BN → ReLU → Conv → BN → ReLU → Conv → BN → (Add) → ReLU
+#Basic： Conv → BN → ReLU → Conv → BN → (Add) → ReLU
 def resnet_block(x, params, block_id):
     """
     x: (B, C, H, W)
@@ -46,29 +51,47 @@ def resnet_block(x, params, block_id):
     返回: out (B,C,H,W), cache (x, out1, out2, out_final)
     """
     out1_conv, _, _ = conv(x, params['conv1_w'], params['conv1_b'], stride=1, padding=1)
-    out1 = silu(out1_conv)
+    out1_bn,bn1_cache= batch_norm(out1_conv,params['gamma1'],params['beta1'],training=True)
+    out1 = silu(out1_bn)
     out2_conv, _, _ = conv(out1, params['conv2_w'], params['conv2_b'], stride=1, padding=1)
-    out2 = out2_conv + x
-    out_final = silu(out2)
-    cache = (x, out1, out2, out_final)
+    out2_bn,bn2_cache= batch_norm(out2_conv,params['gamma2'],params['beta2'],training=True)
+
+    out3_conv, _, _ = conv(x, params['conv3_w'], None, stride=1, padding=0)
+    out3_bn,bn3_cache= batch_norm(out3_conv,params['gamma3'],params['beta3'],training=True)
+
+    out3 = out2_bn + out3_bn
+    out_final = silu(out3)
+    cache = (x, out1,bn1_cache, out1_bn,bn2_cache,bn3_cache,out3,out_final)
     return out_final, cache
 
 def d_resnet_block(dout, cache, params, block_id):
-    x, out1, out2, out_final = cache
+    x, out1,bn1_cache,out1_bn, bn2_cache,bn3_cache,out3, out_final = cache
     # 残差后 ReLU 反向
-    d_relu_final = d_silu(dout, out_final)
+    d_relu_final = d_silu(dout, out3)
     # 残差连接分配
-    d_conv2_out = d_relu_final
-    d_residual = d_relu_final
+    d_bn3_out = d_relu_final
+    d_bn2_out = d_relu_final
+    # bn 反向
+    d_bn3, dgamma3, dbeta3 = d_batch_norm(d_bn3_out,bn3_cache)
+    # conv3 反向
+    dx_conv3, dw3, db3 = d_conv(d_bn3, x, params['conv3_w'], stride=1, padding=0)
+    # bn 反向
+    d_bn2, dgamma2, dbeta2 = d_batch_norm(d_bn2_out,bn2_cache)
     # conv2 反向
-    dx_conv2, dw2, db2 = d_conv(d_conv2_out, out1, params['conv2_w'], stride=1, padding=1)
+    dx_conv2, dw2, db2 = d_conv(d_bn2, out1, params['conv2_w'], stride=1, padding=1)
     # conv1 反向
-    d_relu1 = d_silu(dx_conv2, out1)
-    dx_conv1, dw1, db1 = d_conv(d_relu1, x, params['conv1_w'], stride=1, padding=1)
-    dx = dx_conv1 + d_residual
+    d_relu1 = d_silu(dx_conv2, out1_bn)
+    # bn 反向
+    d_bn1, dgamma1, dbeta1 = d_batch_norm(d_relu1,bn1_cache)
+    dx_conv1, dw1, db1 = d_conv(d_bn1, x, params['conv1_w'], stride=1, padding=1)
+    dx = dx_conv1 + dx_conv3
     grads = {
         'conv1_w': dw1, 'conv1_b': db1,
-        'conv2_w': dw2, 'conv2_b': db2
+        'gamma1':dgamma1,'beta1':dbeta1,
+        'conv2_w': dw2, 'conv2_b': db2,
+        'gamma2':dgamma2,'beta2':dbeta2,
+        'conv3_w': dw3, 
+        'gamma3':dgamma3,'beta3':dbeta3
     }
     return dx, grads
 
@@ -84,7 +107,7 @@ def resnet18_features(x, params):
     avg_caches = []
     for stage in range(4):
         stage_caches = []
-        for block in range(2):
+        for block in range(1):
             block_params = params[f'stage{stage}']
             # 注意：每个块使用相同的参数名（conv1_w, conv1_b, conv2_w, conv2_b）
             out, block_cache = resnet_block(out, block_params, block)
@@ -104,7 +127,7 @@ def d_resnet18_features(dout, caches, params):
     返回: dx (对输入图像的梯度), grads 字典
     """
     dx = dout
-    grads = {}
+    grads = {'backbone':{}}
     avg_caches = caches['avg_caches']
     # 从后往前遍历阶段
     for stage in range(3, -1, -1):
@@ -113,17 +136,17 @@ def d_resnet18_features(dout, caches, params):
             avg_cache = avg_caches[stage]
             dx = d_avgpool_f(dx,avg_cache)
         stage_caches = caches[f'stage{stage}']  # list
+        stage_grads={}
         # 块反向
         for block_idx in range(len(stage_caches)-1, -1, -1):
             block_cache = stage_caches[block_idx]
             block_params = params[f'stage{stage}']
             dx, block_grads = d_resnet_block(dx, block_cache, block_params, block_idx)
-            # 合并梯度
+            # 记录梯度
             for k, v in block_grads.items():
-                if k not in grads:
-                    grads[k] = v
-                else:
-                    grads[k] += v
+                if k not in stage_grads:
+                    stage_grads[k] = v
+        grads['backbone'][f'stage{stage}'] = stage_grads
     # stem 反向
     t0 = time.perf_counter()
     dx_stem, stem_grads = d_resnet_stem(dx, caches['stem'], params['stem'])
@@ -251,10 +274,186 @@ def d_bev_pool(dout_bev, lift_feat, geom_indices, bev_shape):
     return d_lift
 
 # ============================
-# 4. BEV 编码器
+# UNet 风格网络（下采样 8 倍再上采样）
 # ============================
+def bev_encoder(x, params):
+    caches = {}
+    enc_outs = []
 
-def bev_encoder(bev_feat, params):
+    # ---------- 编码器 ----------
+    out = x   # 初始化 out
+    for stage in range(3):
+        stage_params = params[f'enc{stage}']   # 保留您原有的路径
+        # 第一个卷积块
+        caches[f'enc{stage}_conv1'] = out
+        out, c_conv1,_ = conv(out, stage_params['conv1_w'], stage_params['conv1_b'], stride=1, padding=1)
+        out, c_bn1 = batch_norm(out, stage_params['gamma1'], stage_params['beta1'], training=True)
+        caches[f'enc{stage}_relu1_in'] = out   # 保存 ReLU 输入
+        out = silu(out)
+        # 第二个卷积块
+        caches[f'enc{stage}_conv2'] = out
+        out, c_conv2,_ = conv(out, stage_params['conv2_w'], stage_params['conv2_b'], stride=1, padding=1)
+        out, c_bn2 = batch_norm(out, stage_params['gamma2'], stage_params['beta2'], training=True)
+        caches[f'enc{stage}_relu2_in'] = out   # 保存 ReLU 输入
+        out = silu(out)
+
+        enc_outs.append(out)
+        out, c_pool = maxpool(out, kernel_size=2, stride=2, padding=0)
+        caches[f'pool{stage}'] = c_pool
+        caches[f'enc{stage}_bn1'] = c_bn1
+        caches[f'enc{stage}_bn2'] = c_bn2
+
+    caches['enc_outs'] = enc_outs   # 保存跳跃连接列表，便于反向使用
+    # ---------- bottom ----------
+    bottom_params = params['bottom']
+    caches['bottom'] = out 
+    out, c_conv,_=conv(out,bottom_params['conv_w'],bottom_params['conv_b'],stride=1,padding=3)
+
+    # ---------- 解码器 ----------
+    for stage in range(2, -1, -1):
+        out, c_up = upsample_nearest(out, scale_factor=2)
+        caches[f'up{stage}'] = c_up
+        skip = enc_outs[stage]
+        out = np.concatenate([out, skip], axis=1)
+
+        stage_params = params[f'dec{stage}']
+        caches[f'dec{stage}_conv1'] = out
+        out, c_conv1,_ = conv(out, stage_params['conv1_w'], stage_params['conv1_b'], stride=1, padding=1)
+        out, c_bn1 = batch_norm(out, stage_params['gamma1'], stage_params['beta1'], training=True)
+        caches[f'dec{stage}_relu1_in'] = out
+        out = silu(out)
+
+        caches[f'dec{stage}_conv2'] = out
+        out, c_conv2,_ = conv(out, stage_params['conv2_w'], stage_params['conv2_b'], stride=1, padding=1)
+        out, c_bn2 = batch_norm(out, stage_params['gamma2'], stage_params['beta2'], training=True)
+        caches[f'dec{stage}_relu2_in'] = out
+        out = silu(out)
+
+        caches[f'dec{stage}_bn1'] = c_bn1
+        caches[f'dec{stage}_bn2'] = c_bn2
+
+    return out, caches
+def d_bev_encoder(dout, caches, params):
+    """
+    UNet 反向传播（8倍下采样，三次池化，三次上采样）
+    Args:
+        dout: (N, C_out, H, W) 上游梯度
+        caches: 前向保存的缓存字典
+        params: 参数字典（同前向，包含 'bev_encoder' 外层）
+    Returns:
+        dx: (N, C_in, H, W) 输入梯度
+        grads: 与 params 结构相同的梯度字典
+    """
+    dx = dout
+    grads = {}
+    enc_outs = caches['enc_outs']   # 跳跃连接列表
+
+    # ---------- 解码器反向（从 stage=0 到 2，因为前向从 2 到 0） ----------
+    skip_grads = {}   # 暂存跳跃连接梯度，用于编码器反向累加
+
+    for stage in range(3):
+        # 获取当前解码块的缓存
+        c_conv2 = caches[f'dec{stage}_conv2']
+        c_bn2 = caches[f'dec{stage}_bn2']
+        c_conv1 = caches[f'dec{stage}_conv1']
+        c_bn1 = caches[f'dec{stage}_bn1']
+        relu2_in = caches[f'dec{stage}_relu2_in']
+        relu1_in = caches[f'dec{stage}_relu1_in']
+
+        # ---- 反传第二个卷积块（conv2 -> bn2 -> relu2） ----
+        dx = d_silu(dx, x=relu2_in)
+        dx_bn2, dgamma2, dbeta2 = d_batch_norm(dx, c_bn2)
+        x_conv2 = c_conv2
+        w_conv2 = params[f'dec{stage}']['conv2_w']
+        dx, dw_conv2, db_conv2 = d_conv(dx_bn2, x_conv2, w_conv2, stride=1, padding=1)
+
+        # ---- 反传第一个卷积块（conv1 -> bn1 -> relu1） ----
+        dx = d_silu(dx, x=relu1_in)
+        dx_bn1, dgamma1, dbeta1 = d_batch_norm(dx, c_bn1)
+        x_conv1 = c_conv1
+        w_conv1 = params[f'dec{stage}']['conv1_w']
+        dx, dw_conv1, db_conv1 = d_conv(dx_bn1, x_conv1, w_conv1, stride=1, padding=1)
+
+        # 保存解码块梯度
+        grads[f'dec{stage}'] = {
+            'conv2_w': dw_conv2,
+            'conv2_b': db_conv2,
+            'gamma2': dgamma2,
+            'beta2': dbeta2,
+            'conv1_w': dw_conv1,
+            'conv1_b': db_conv1,
+            'gamma1': dgamma1,
+            'beta1': dbeta1
+        }
+
+        # ---- 处理拼接和上采样 ----
+        # 当前 dx 是第一个卷积块对输入（拼接后的结果）的梯度
+        skip = enc_outs[stage]
+        C_skip = skip.shape[1]
+        C_total = dx.shape[1]
+        C_up = C_total - C_skip
+        dx_up = dx[:, :C_up, :, :]          # 上采样部分的梯度
+        dx_skip = dx[:, C_up:, :, :]        # 跳跃连接部分的梯度
+
+        # 暂存跳跃连接梯度，供编码器反向时累加
+        if stage not in skip_grads:
+            skip_grads[stage] = dx_skip
+        else:
+            skip_grads[stage] += dx_skip
+
+        # 上采样反向（最近邻插值）
+        c_up_cache = caches[f'up{stage}']
+        dx = d_upsample_nearest(dx_up, c_up_cache)
+    # bottom
+    dx,dw_conv,db_conv = d_conv(dx,caches['bottom'],params['bottom']['conv_w'],stride=1,padding=3)
+    grads['bottom']={'conv_w':dw_conv,'conv_b':db_conv}
+    # ---------- 编码器反向（从 stage=2 到 0） ----------
+    for stage in range(2, -1, -1):
+        # 反传池化（对应前向的 maxpool）
+        c_pool = caches[f'pool{stage}']
+        dx = d_maxpool(dx, c_pool)
+
+        # 累加跳跃连接梯度
+        if stage in skip_grads:
+            dx = dx + skip_grads[stage]
+
+        # 反传编码器块（逆序：先 conv2 后 conv1）
+        c_conv2 = caches[f'enc{stage}_conv2']
+        c_bn2 = caches[f'enc{stage}_bn2']
+        c_conv1 = caches[f'enc{stage}_conv1']
+        c_bn1 = caches[f'enc{stage}_bn1']
+        relu2_in = caches[f'enc{stage}_relu2_in']
+        relu1_in = caches[f'enc{stage}_relu1_in']
+
+        # ---- 反传第二个卷积块 ----
+        dx = d_silu(dx, x=relu2_in)
+        dx_bn2, dgamma2, dbeta2 = d_batch_norm(dx, c_bn2)
+        x_conv2 = c_conv2
+        w_conv2 = params[f'enc{stage}']['conv2_w']
+        dx, dw_conv2, db_conv2 = d_conv(dx_bn2, x_conv2, w_conv2, stride=1, padding=1)
+
+        # ---- 反传第一个卷积块 ----
+        dx = d_silu(dx, x=relu1_in)
+        dx_bn1, dgamma1, dbeta1 = d_batch_norm(dx, c_bn1)
+        x_conv1 = c_conv1
+        w_conv1 = params[f'enc{stage}']['conv1_w']
+        dx, dw_conv1, db_conv1 = d_conv(dx_bn1, x_conv1, w_conv1, stride=1, padding=1)
+
+        # 保存编码块梯度
+        grads[f'enc{stage}'] = {
+            'conv2_w': dw_conv2,
+            'conv2_b': db_conv2,
+            'gamma2': dgamma2,
+            'beta2': dbeta2,
+            'conv1_w': dw_conv1,
+            'conv1_b': db_conv1,
+            'gamma1': dgamma1,
+            'beta1': dbeta1
+        }
+
+    # 最终 dx 是输入图像的梯度
+    return dx, grads
+def bev_encoder_1(bev_feat, params):
     """
     bev_feat: (B, C_in, X, Y)
     params: {'weights': list, 'biases': list}
@@ -262,14 +461,15 @@ def bev_encoder(bev_feat, params):
     """
     out = bev_feat
     caches = []
-    for w, b in zip(params['weights'], params['biases']):
+    for w, b,gamma,beta in zip(params['weights'], params['biases'],params['gammas'],params['betas']):
         out_conv, _, _ = conv(out, w, b, stride=1, padding=1)
+        out_bn,bn_cache= batch_norm(out_conv,gamma,beta)
         out_relu = silu(out_conv)
-        caches.append((out, out_conv, out_relu))
+        caches.append((out, out_conv,bn_cache, out_relu))
         out = out_relu
     return out, caches
 
-def d_bev_encoder(dout, caches, params):
+def d_bev_encoder_1(dout, caches, params):
     """
     dout: (B, C_out, X, Y)
     caches: 列表，每项 (input, conv_out, relu_out)
@@ -279,18 +479,25 @@ def d_bev_encoder(dout, caches, params):
     dx = dout
     grads_w = []
     grads_b = []
+    grads_gamma = []
+    grads_beta = []
     for i in range(len(caches)-1, -1, -1):
-        inp, conv_out, relu_out = caches[i]
+        inp, conv_out,bn_cache, relu_out = caches[i]
         w = params['weights'][i]
         b = params['biases'][i]
         d_x_relu = d_silu(dx, relu_out)
-        d_conv_in, dw, db = d_conv(d_x_relu, inp, w, stride=1, padding=1)
+        d_x_bn,d_gamma,d_beta = d_batch_norm(d_x_relu,bn_cache)
+        d_conv_in, dw, db = d_conv(d_x_bn, inp, w, stride=1, padding=1)
         dx = d_conv_in
         grads_w.append(dw)
         grads_b.append(db)
+        grads_gamma.append(d_gamma)
+        grads_beta.append(d_beta)
     grads_w.reverse()
     grads_b.reverse()
-    grads = {'weights': grads_w, 'biases': grads_b}
+    grads_gamma.reverse()
+    grads_beta.reverse()
+    grads = {'weights': grads_w, 'biases': grads_b,'gammas':grads_gamma,'betas':grads_beta}
     return dx, grads
 
 # ============================
@@ -329,7 +536,7 @@ def d_centernet_head(dheatmap, dreg, reg,bev_feat, head_params):
 # ============================
 # 6. 损失函数及其梯度
 # ============================
-def focal_loss(heatmap_pred, heatmap_gt, alpha=0.25, gamma=2.0):
+def focal_loss(heatmap_pred, heatmap_gt, alpha=0.25, gamma=0.0):
     """
     软标签 Focal Loss，适用于 heatmap_gt 为连续值 [0,1]
     """
@@ -650,7 +857,7 @@ def d_depth_loss1(depth_pred, depth_gt, cache=None):
     grad = grad_flat.reshape(B, H, W, D).transpose(0, 3, 1, 2)
     return grad
 def compute_losses(heatmap_pred, reg_pred, heatmap_gt, reg_gt, depth_pred=None, depth_gt=None,
-                   hm_weight=1.0, reg_weight=1.0, depth_weight=1.0,hm_alpha=0.25, hm_gamma=2.0):
+                   hm_weight=1.0, reg_weight=1.0, depth_weight=1.0,hm_alpha=0.25, hm_gamma=0.0):
     loss_hm = hm_weight * focal_loss(heatmap_pred, heatmap_gt,alpha=hm_alpha,gamma=hm_gamma)
     loss_reg = reg_weight * reg_l1_loss(reg_pred, reg_gt, heatmap_gt)
     depth_cache = None
@@ -705,7 +912,6 @@ def bev_forward(images, geom_indices_list, bev_shape, model_params):
     features = np.stack(feat_list, axis=0).reshape(B, N, feat.shape[1], feat.shape[2], feat.shape[3])
     caches['backbone_caches'] = backbone_caches
     caches['features'] = features
-
     # 2. Lift
     lift_feats = []
     depth_logits_list = []
@@ -743,7 +949,28 @@ def bev_forward(images, geom_indices_list, bev_shape, model_params):
     caches['reg'] = reg
 
     return heatmap, reg, depth_logits_list, bev_feat, caches
-
+def merge_grads(dst, src):
+    """
+    递归合并梯度字典，原地修改 dst。
+    支持嵌套字典和列表（若需要）。
+    dst: 目标梯度字典（累加结果）
+    src: 源梯度字典（待累加）
+    返回: dst（已修改）
+    """
+    for key, value in src.items():
+        if key in dst:
+            dst_val = dst[key]
+            if isinstance(value, dict) and isinstance(dst_val, dict):
+                # 递归合并子字典
+                merge_grads(dst_val, value)
+            elif isinstance(value, np.ndarray) and isinstance(dst_val, np.ndarray):
+                dst[key] = dst_val + value
+            else:
+                # 类型不匹配时直接覆盖（可根据需要改为 raise）
+                dst[key] = value
+        else:
+            dst[key] = value
+    return dst
 def bev_backward(dheatmap, dreg, ddepth_list, caches, model_params, geom_indices_list, bev_shape):
     """
     dheatmap: (B, num_classes, X, Y)
@@ -842,13 +1069,9 @@ def bev_backward(dheatmap, dreg, ddepth_list, caches, model_params, geom_indices
         dfeat = dfeatures_flat[i][None, ...]
         t0 = time.perf_counter()
         _, grad_i = d_resnet18_features(dfeat, cache, model_params['backbone'])
+        merge_grads(backbone_grads,grad_i)
         #print(f"d_resnet18 time: {time.perf_counter()-t0:.3f}s")
-        for k, v in grad_i.items():
-            if k not in backbone_grads:
-                backbone_grads[k] = v
-            else:
-                backbone_grads[k] += v
-    grads['backbone'] = backbone_grads
+    grads['backbone'] = backbone_grads['backbone']
 
     # 6. 深度损失梯度（如果有）
     if ddepth_list is not None:
@@ -881,21 +1104,34 @@ def init_model_params(backbone_in=3, backbone_out=512,
                       num_classes=10,global_gain=0.4):
     params = {}
     # Backbone (仅定义所需层)
-    params['backbone'] = {}
+    params['backbone'] = {
+	}
     # stem
     params['backbone']['stem'] = {
         'conv1_w': init_conv_weight((64, backbone_in, 7, 7), gain=global_gain),
-        'conv1_b': np.zeros(64)
+        'conv1_b': np.zeros(64),
+        'gamma':np.ones(64),
+        'beta':np.zeros(64)
     }
     # stages
     for stage in range(4):
-        C = 64  # 保持所有阶段通道数为 64
-        for block in range(2):
+        C_stage = [64,64,128,256,512] 
+        for block in range(1):
+            C =C_stage[stage]
+            Cs=C_stage[stage+1]
+           
             params['backbone'][f'stage{stage}'] = {
-                'conv1_w': init_conv_weight((C, C, 3, 3), gain=global_gain),
-                'conv1_b': np.zeros(C),
-                'conv2_w': init_conv_weight((C, C, 3, 3), gain=global_gain),
-                'conv2_b': np.zeros(C)
+                'conv1_w': init_conv_weight((Cs, C, 3, 3), gain=global_gain),
+                'conv1_b': np.zeros(Cs),
+                'gamma1':np.ones(Cs),
+                'beta1':np.zeros(Cs),
+                'conv2_w': init_conv_weight((Cs, Cs, 3, 3), gain=global_gain),
+                'conv2_b': np.zeros(Cs),
+                'gamma2':np.ones(Cs),
+                'beta2':np.zeros(Cs),
+                'conv3_w': init_conv_weight((Cs, C, 1, 1), gain=global_gain),
+                'gamma3':np.ones(Cs),
+                'beta3':np.zeros(Cs)
             }
     # Lift 输入通道改为 64
     params['lift_depth'] = {
@@ -907,13 +1143,85 @@ def init_model_params(backbone_in=3, backbone_out=512,
         'b': np.zeros(context_channels)
     }
     # BEV encoder
+    base_channels=  bev_channels
+    C_in = context_channels
+    # 编码器通道数
+    enc_channels = [base_channels, base_channels*2, base_channels*4]  # 3层
+    # 解码器通道数（与编码器对称，但拼接后通道数加倍）
+    dec_channels = [base_channels*4, base_channels*2, base_channels]   # 反向
+    params['bev_encoder']={}
+    for stage in range(3):
+        C = enc_channels[stage]
+        # 每层两个卷积，输入通道：第一层为前一层输出（第一层为 C_in），第二层为 C
+        C_in_1 = C_in if stage == 0 else enc_channels[stage-1]
+        params['bev_encoder'][f'enc{stage}'] = {
+            'conv1_w': init_conv_weight((C, C_in_1, 3, 3)),
+            'conv1_b': np.zeros(C),
+            'gamma1': np.ones(C),
+            'beta1': np.zeros(C),
+            'conv2_w': init_conv_weight((C, C, 3, 3)),
+            'conv2_b': np.zeros(C),
+            'gamma2': np.ones(C),
+            'beta2': np.zeros(C),
+        }
+    C = enc_channels[-1]
+    params['bev_encoder']['bottom']={
+        'conv_w':init_conv_weight((C,C,7,7)),
+        'conv_b':np.zeros(C)
+	}
+    # 解码器（通道数：上采样后与跳跃拼接，所以输入通道为 dec_C + enc_C）
+    for stage in range(2,-1,-1):
+        C = enc_channels[stage]
+        # 第一个卷积输入通道：上采样后通道数 + 跳跃连接通道数
+        if stage == 2:  # 最底层，输入为编码器最底层输出通道
+            in_ch = enc_channels[2]
+        else:
+            in_ch = enc_channels[stage+1]  # 上一解码器输出通道
+        # 上采样后通道数不变，拼接后变为 in_ch + enc_channels[stage]
+        conv1_in = in_ch + enc_channels[stage]
+        params['bev_encoder'][f'dec{stage}'] = {
+            'conv1_w': init_conv_weight((C, conv1_in, 3, 3)),
+            'conv1_b': np.zeros(C),
+            'gamma1': np.ones(C),
+            'beta1': np.zeros(C),
+            'conv2_w': init_conv_weight((C, C, 3, 3)),
+            'conv2_b': np.zeros(C),
+            'gamma2': np.ones(C),
+            'beta2': np.zeros(C),
+        }
+    '''
+    # BEV encoder
+    params['bev_encoder']={}
+    # stages
+    for stage in range(2):
+        params['bev_encoder'][f'stage{stage}'] = {}
+        C = context_channels 
+        for block in range(2):
+            params['bev_encoder'][f'stage{stage}'][f'block{block}'] = {
+                'conv1_w': init_conv_weight((C, C, 3, 3), gain=global_gain),
+                'conv1_b': np.zeros(C),
+                'gamma1':np.ones(C),
+                'beta1':np.zeros(C),
+                'conv2_w': init_conv_weight((C, C, 3, 3), gain=global_gain),
+                'conv2_b': np.zeros(C),
+                'gamma2':np.ones(C),
+                'beta2':np.zeros(C),
+                'conv3_w': init_conv_weight((C, C, 1, 1), gain=global_gain),
+                'gamma3':np.ones(C),
+                'beta3':np.zeros(C)
+            }
+    import pdb;pdb.set_trace()
+    # BEV encoder
     params['bev_encoder'] = {
         'weights': [
             init_conv_weight((bev_channels, context_channels, 3, 3), gain=global_gain),
             init_conv_weight((bev_channels, bev_channels, 3, 3), gain=global_gain)
         ],
-        'biases': [np.zeros(bev_channels), np.zeros(bev_channels)]
+        'biases': [np.zeros(bev_channels), np.zeros(bev_channels)],
+        'gammas':[np.ones(bev_channels),np.ones(bev_channels)],
+        'betas':[np.zeros(bev_channels),np.zeros(bev_channels)]
     }
+    '''
     # Head
     params['head'] = {
         'heatmap_w': init_conv_weight((num_classes, bev_channels, 3, 3), gain=1.0),
@@ -922,24 +1230,57 @@ def init_model_params(backbone_in=3, backbone_out=512,
         'reg_b': np.zeros(8)
     }
     return params
-
+def check_nan(grads, prefix=""):
+    """
+    递归检查梯度字典中是否存在 NaN 或 Inf。
+    返回 True 表示发现 NaN/Inf，否则 False。
+    """
+    has_nan = False
+    for k, v in grads.items():
+        key = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            # 递归检查子字典
+            if check_nan(v, key):
+                has_nan = True
+        elif isinstance(v, list):
+            # 检查列表中的每个元素
+            for i, vi in enumerate(v):
+                if isinstance(vi, dict):
+                    if check_nan({f"{key}[{i}]": vi}, ""):
+                        has_nan = True
+                elif isinstance(vi, np.ndarray):
+                    if np.any(np.isnan(vi)) or np.any(np.isinf(vi)):
+                        print(f"NaN/Inf found in {key}[{i}]")
+                        has_nan = True
+                elif vi is not None:
+                    print(f"Warning: {key}[{i}] is not an array/dict, type={type(vi)}")
+        elif isinstance(v, np.ndarray):
+            if np.any(np.isnan(v)) or np.any(np.isinf(v)):
+                print(f"NaN/Inf found in {key}")
+                has_nan = True
+        elif v is None:
+            # 忽略 None 值（通常表示无梯度）
+            pass
+        else:
+            print(f"Warning: {key} is not an array/dict/list, type={type(v)}")
+    return has_nan
 # ============================
 # 9. 测试函数
 # ============================
 
 if __name__ == "__main__":
     # 设置参数
-    bev_shape = (200, 200)
-    B, N, H, W = 2, 6, 256, 704
+    bev_shape = (88,88)
+    B, N, H, W = 1, 6, 256, 704
     depth_bins = 41
     context_channels = 64
     bev_channels = 64
-    num_classes = 10
+    num_classes = 11
 
     # 初始化参数
     model_params = init_model_params(
         backbone_in=3,
-        backbone_out=64,
+        backbone_out=512,
         depth_bins=depth_bins,
         context_channels=context_channels,
         bev_channels=bev_channels,
@@ -962,11 +1303,15 @@ if __name__ == "__main__":
             idx = np.random.randint(0, bev_shape[0]*bev_shape[1], size=N_points)
             cam_indices.append(idx)
         geom_indices_list.append(cam_indices)
-
+    import time
+    start = time.perf_counter()
     # 前向
     heatmap, reg, depth_logits_list, bev_feat, caches = bev_forward(
         images, geom_indices_list, bev_shape, model_params
     )
+    elapsed = time.perf_counter() - start
+    print(f"BEV forward 耗时:{elapsed:.4f} 秒")
+
     print("前向完成")
     print("heatmap shape:", heatmap.shape)
     print("reg shape:", reg.shape)
@@ -975,43 +1320,39 @@ if __name__ == "__main__":
 
     # 随机生成目标
     heatmap_gt = np.zeros_like(heatmap)
-    heatmap_gt[0, 0, 100, 100] = 1
+    heatmap_gt[0, 0, 40,50] = 1
     reg_gt = np.random.randn(*reg.shape).astype(np.float32)
     depth_gt = np.random.randint(0, depth_bins, size=(B, Hf, Wf)).astype(np.int32)
     # 提取每个 batch 第一个相机的深度 logits，并堆叠为 (B, D, Hf, Wf)
     depth_logits_batch = np.stack([depth_logits_list[b * N] for b in range(B)], axis=0)  # (B, D, Hf, Wf)
-
+    depth_logits_batch = depth_logits_batch[None,...]
     # 计算损失
     losses,loss_caches = compute_losses(heatmap, reg, heatmap_gt, reg_gt, depth_logits_batch, depth_gt)
     print("Losses:", losses)
 
     # 计算损失对输出的梯度
+    
     dheatmap, dreg, ddepth = d_compute_losses(heatmap, reg, heatmap_gt, reg_gt, depth_logits_batch, depth_gt,loss_caches)
     print("dheatmap shape:", dheatmap.shape)
     print("dreg shape:", dreg.shape)
     print("ddepth shape:", ddepth.shape if ddepth is not None else None)
 
+    start = time.perf_counter()
     # 反向传播
     grads = bev_backward(
-        dheatmap, dreg, [ddepth] * (B*N),  # 每个相机相同的深度梯度（示例）
+        dheatmap, dreg, [ddepth[0]]*(N),  
         caches, model_params, geom_indices_list, bev_shape
     )
+    elapsed = time.perf_counter() - start
+    print(f"BEV bacward 耗时:{elapsed:.4f} 秒")
+
     print("反向完成")
     print("梯度键:", grads.keys())
 
     # 检查梯度是否包含 nan
-    has_nan = False
-    for k, v in grads.items():
-        if isinstance(v, dict):
-            for kk, vv in v.items():
-                if np.any(np.isnan(vv)):
-                    print(f"NaN found in {k}.{kk}")
-                    has_nan = True
-        else:
-            if np.any(np.isnan(v)):
-                print(f"NaN found in {k}")
-                has_nan = True
+    has_nan = check_nan(grads)
     if not has_nan:
-        print("所有梯度正常，无 NaN")
-
+        print("所有梯度正常，无 NaN/Inf")
+    else:
+        print("存在 NaN/Inf，请检查！")
     print("测试完成")
