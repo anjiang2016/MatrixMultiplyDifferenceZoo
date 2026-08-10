@@ -6,6 +6,8 @@ bev_lss/bev_stitch_output
 bev_lss/samples_output_with_annotations
 bev_lss/bev_vis_results
 bev_lss/bev_vis
+bev_lss/bev_vis_\345\211\257\346\234\254
+bev_lss/bev_vis_\345\211\257\346\234\2542
 do_nuscenes/bev_frames
 do_nuscenes/map_whole_output
 do_nuscenes/map_output
