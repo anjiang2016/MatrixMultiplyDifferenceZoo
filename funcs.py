@@ -202,6 +202,55 @@ def d_sigmoid(x, y=None):
     else:
         s = sigmoid(x)
         return s * (1 - s)
+# ============================
+# 最近邻上采样（插值）
+# ============================
+def upsample_nearest(x, scale_factor):
+    """
+    最近邻上采样（仅空间维度 H, W）
+
+    Args:
+        x: (N, C, H, W) 输入
+        scale_factor: int 或 (scale_h, scale_w)，上采样倍数
+
+    Returns:
+        out: (N, C, H*scale_h, W*scale_w)
+        cache: (x_shape, scale_factor)
+    """
+    N, C, H, W = x.shape
+    if isinstance(scale_factor, int):
+        scale_h = scale_w = scale_factor
+    else:
+        scale_h, scale_w = scale_factor
+
+    # 使用 repeat 沿 H 和 W 维度复制
+    out = np.repeat(np.repeat(x, scale_h, axis=2), scale_w, axis=3)
+    cache = (x.shape, (scale_h, scale_w))
+    return out, cache
+
+
+def d_upsample_nearest(dout, cache):
+    """
+    最近邻上采样的反向传播（梯度累加）
+
+    Args:
+        dout: (N, C, H_out, W_out) 上游梯度
+        cache: (x_shape, (scale_h, scale_w))
+
+    Returns:
+        dx: (N, C, H_in, W_in)
+    """
+    x_shape, (scale_h, scale_w) = cache
+    N, C, H_in, W_in = x_shape
+
+    # 将 dout 切分成块，每块大小 scale_h x scale_w，然后求和
+    H_out, W_out = dout.shape[2], dout.shape[3]
+    # 确保 H_out == H_in * scale_h, W_out == W_in * scale_w
+    # 重新形状为 (N, C, H_in, scale_h, W_in, scale_w)
+    dout_reshaped = dout.reshape(N, C, H_in, scale_h, W_in, scale_w)
+    # 对 scale_h 和 scale_w 维度求和
+    dx = dout_reshaped.sum(axis=(3, 5))
+    return dx
 # ========== 最大池化（快速版本） ==========
 def maxpool(x, kernel_size, stride=None, padding=0):
     """
