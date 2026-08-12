@@ -31,7 +31,7 @@ IMG_H, IMG_W = 900, 1600
 
 
 # ========== 2. BEV 网格参数 ==========
-
+# 自车系下的网格范围，转到地图坐标系下就是(0,40)(0,40)
 X_MIN, X_MAX = 0.0, 40.0
 Y_MIN, Y_MAX = -20.0, 20.0
 Z_FIXED = 0.0               # 默认地面高度，可改成任意值
@@ -42,18 +42,18 @@ RES = 0.1
 def build_lut(z_fixed=Z_FIXED):
     # ===== 1. 在地图坐标系下生成网格 =====
     # 地图坐标系：X 向右，Y 向下（车头朝上）
-    x_map = np.arange(X_MIN, X_MAX, RES) 
-    y_map = np.arange(X_MIN, X_MAX, RES)   
+    x_map = np.arange(0, X_MAX-X_MIN, RES) 
+    y_map = np.arange(0, Y_MAX-Y_MIN, RES)   
     xv, yv = np.meshgrid(x_map, y_map)
 
     X_map = xv.flatten()  # 地图 X
     Y_map = yv.flatten()  # 地图 Y
     # ===== 2. 定义地图坐标系 → 自车坐标系的变换矩阵 =====
     R_map_to_ego = np.array([
-        [0, -1],
-        [-1,  0]
+        [0,-1],
+        [-1,0]
     ])
-    t_map_to_ego = np.array([X_MAX,Y_MAX])  # 原点重合，无平移
+    t_map_to_ego = np.array([Y_MAX-Y_MIN,(X_MAX-X_MIN)/2]) 
     # ===== 3. 用矩阵乘法将地图坐标映射到自车坐标 =====
     # [X_ego; Y_ego] = R_map_to_ego @ [X_map; Y_map] + t_map_to_ego
     map_coords = np.vstack([X_map, Y_map])  # (2, N)
@@ -137,44 +137,22 @@ def bilinear_sample(img, u, v):
 def generate_bev(img, lut):
     u, v, grid_shape, X, Y, Z = lut
     bev_h, bev_w = grid_shape
-#    //车前朝右
-#    bev_map = np.zeros((bev_h, bev_w, 3), dtype=np.uint8)
-    #车前朝上
-    bev_map = np.zeros((bev_w, bev_h, 3), dtype=np.uint8)
-    map_h,map_w = int((Y_MAX-Y_MIN)/RES),int((X_MAX-X_MIN)/RES)
+    bev_map = np.zeros((bev_h, bev_w, 3), dtype=np.uint8)
+
     for i in range(len(u)):
         ui, vi = u[i], v[i]
         if 0 <= ui < IMG_W and 0 <= vi < IMG_H:
             color = bilinear_sample(img, ui, vi)
-            #row = int((Y[i] - Y_MIN) / RES)
-            #col = int((X[i] - X_MIN) / RES)
-            #车前朝右
-#            bev_map[row, col] = color
-            #车前朝上
-            row = int(round((Y_MAX-Y[i]) / RES))
-            col = int(round((X_MAX-X[i]) / RES))
-            if 0<=row<map_h and 0<=col<map_w:
-                bev_map[col,row] = color
-    
+            row = round(Y[i] / RES)
+            col = round(X[i] / RES)
+            bev_map[row, col] = color
     return bev_map
-from scipy.ndimage import map_coordinates
 
-def generate_bev_fast_(img, lut):
-    import pdb;pdb.set_trace()
-    u, v, grid_shape, X, Y, Z = lut
-    bev_h, bev_w = grid_shape  # bev_h = 400 (Y方向), bev_w = 500 (X方向)
+  
 
-    u = u.astype(np.float64).flatten()
-    v = v.astype(np.float64).flatten()
-    coords = np.vstack([v,u])  # (2, N)
 
-    # 对图像进行双线性插值采样（order=1），mode='nearest' 保证越界时取边缘值
-    sampled = map_coordinates(img, coords, order=1, mode='nearest')  # (N, 3)
 
-    # 重塑为你定义的形状 (bev_w, bev_h, 3) 并转为 uint8
-    bev_map = sampled.reshape(bev_h, bev_w, 3).astype(np.uint8)
 
-    return bev_map
 from scipy.ndimage import map_coordinates
 
 def generate_bev_fast(img, lut):
@@ -243,7 +221,8 @@ if __name__ == "__main__":
         exit()
 
     # 生成 BEV
-    bev = generate_bev_fast(img_np, lut_fixed)
+    #bev = generate_bev_fast(img_np, lut_fixed)
+    bev = generate_bev(img_np, lut_fixed)
     print("BEV 生成完成")
     # 将 BEV 图缩放到与原图高度一致（保持宽高比）
     h_orig = img_np.shape[0]
