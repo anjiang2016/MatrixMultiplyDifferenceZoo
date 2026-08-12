@@ -30,6 +30,18 @@ def grid_to_world(gx, gy, bev_size=BEV_SIZE, bev_range=(-50,50), bev_res=1.0):
     y = (gx) * bev_res + bev_range[0]
     x = (bev_size[1] - 1 - gy) * bev_res + bev_range[0]
     return x, y
+def grid_to_world_gt(gx, gy, bev_size=BEV_SIZE, bev_range=(-50,50), bev_res=1.0):
+    """
+    将BEV网格坐标 (gx, gy) 转换为世界坐标 (x, y) 米。
+    注意：训练时 heatmap_gt 生成时做了 gx = bev_size[0] - 1 - gx，gy = bev_size[1] - 1 - gy
+    因此解码出的网格坐标已经是翻转后的。我们需要将其映射回世界坐标：
+    world_x = (bev_size[0] - 1 - gx) * bev_res + bev_range[0]
+    #world_y = (bev_size[1] - 1 - gy) * bev_res + bev_range[0]
+    world_y = (gy) * bev_res + bev_range[0]
+    """
+    x = (gx) * bev_res + bev_range[0]
+    y = (gy) * bev_res + bev_range[0]
+    return x, y
 def decode_heatmap(heatmap, reg, threshold=0.1, topk=30):
     """
     解码 heatmap 和 reg，返回预测框列表。
@@ -93,7 +105,7 @@ def visualize_bev(gt_boxes, pred_boxes, bev_size=BEV_SIZE, save_path=None):
     ax.grid(True, linestyle='--', alpha=0.5)
     # 绘制预测框（红色）
     for box in pred_boxes:
-        x_world, y_world = grid_to_world(box['gx'], box['gy'])
+        x_world, y_world = grid_to_world_gt(box['gx'], box['gy'])
         w, l, sin, cos = box['w'], box['l'], box['sin'], box['cos']
         # 计算朝向角
         yaw = np.arctan2(sin, cos)
@@ -110,16 +122,16 @@ def visualize_bev(gt_boxes, pred_boxes, bev_size=BEV_SIZE, save_path=None):
         ax.plot(x_world, y_world, 'ro', markersize=2)
     # 绘制 GT 框（绿色）
     for box in gt_boxes:
-        x_world, y_world = grid_to_world(box['gx'], box['gy'])
+        x_world, y_world = grid_to_world_gt(box['gx'], box['gy'])
         w, l, sin, cos = box['w'], box['l'], box['sin'], box['cos']
-        yaw = np.arctan2(sin, -cos)
+        yaw = np.arctan2(sin, cos)
         rect = patches.Rectangle(
             (x_world - w/2, y_world - l/2), w, l,
             angle=np.rad2deg(yaw),
             linewidth=2, edgecolor='green', facecolor='none', alpha=0.8
         )
         ax.add_patch(rect)
-        ax.plot(y_world, x_world, 'go', markersize=2)
+        ax.plot(x_world, y_world, 'go', markersize=2)
 
     ax.set_title('BEV Visualization (Green: GT, Red: Pred)')
     if save_path:
