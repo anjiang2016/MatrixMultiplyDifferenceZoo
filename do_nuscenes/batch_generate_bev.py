@@ -7,7 +7,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 # 从你已有的 get_bev.py 中导入核心函数
-from get_bev import build_lut, generate_bev_fast, K, Rt_full, X_MIN, X_MAX, Y_MIN, Y_MAX, RES
+from get_bev import build_lut, generate_bev,generate_bev_fast, K, Rt_full, X_MIN, X_MAX, Y_MIN, Y_MAX, RES
 
 # ========== 1. 配置 ==========
 DATAROOT = Path("/Users/zhaomingming/data_sets/v1.0-mini")
@@ -56,8 +56,9 @@ for idx, entry in enumerate(tqdm(cam_front_items)):
         img = np.array(Image.open(image_path))
         
         # 生成 BEV 图
-        bev = generate_bev_fast(img, lut)
-        
+#bev = generate_bev_fast(img, lut)
+        bev = generate_bev(img, lut)
+
         # 保存为帧（用 6 位数字编号，方便 ffmpeg 合成）
         frame_name = f"frame_{idx:06d}.jpg"
         frame_path = OUTPUT_DIR / frame_name

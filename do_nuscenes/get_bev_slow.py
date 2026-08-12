@@ -95,9 +95,7 @@ def bilinear_sample(img, u, v):
 def generate_bev(img, lut):
     u, v, grid_shape, X, Y, Z = lut
     bev_h, bev_w = grid_shape
-#    //车前朝右
 #    bev_map = np.zeros((bev_h, bev_w, 3), dtype=np.uint8)
-    #车前朝上
     bev_map = np.zeros((bev_w, bev_h, 3), dtype=np.uint8)
     map_h,map_w = int((Y_MAX-Y_MIN)/RES),int((X_MAX-X_MIN)/RES)
     for i in range(len(u)):
