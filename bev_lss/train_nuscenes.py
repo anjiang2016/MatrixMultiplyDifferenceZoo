@@ -705,7 +705,7 @@ def main():
 
     # 获取样本列表
     samples = load_json('v1.0-mini/sample.json')
-    sample_tokens = [s['token'] for s in samples[:3]]  # 使用前20个样本测试
+    sample_tokens = [s['token'] for s in samples]  # 使用前20个样本测试
     # 在 main() 中，获取样本列表后
     category_counts,class_counts = count_categories(sample_tokens)
     print("=== 类别统计 ===")
@@ -739,10 +739,10 @@ def main():
         geom_indices_cache[token] = [build_geometry_indices(token, model_params, H, W, Hf, Wf)]
     samples = get_samples(sample_tokens,geom_indices_cache,instance_to_category,H,W,Hf,Wf)
     # 超参数
-    lr_init = 3e-3
-    epochs = 100
+    lr_init = 3e-4
+    epochs = 1000
     hm_weight = 0.1*0.5
-    reg_weight =100.0*0
+    reg_weight =100.0*100.0*0.0
     depth_weight =10.0*3.0*0
     # ---------- 尝试加载最佳模型 ----------
     best_loss = float('inf')
@@ -766,9 +766,14 @@ def main():
     start_epoch = 0
     best_loss = float('inf')
     for epoch in range(start_epoch,epochs):
+        if epoch>100:
+            hm_weight = 0.1*0.5*0.1
+            reg_weight = 100.0*100.0
+            lr_init = 9e-5
         total_loss = 0.0
-        lr = cosine_annealing(epoch,epochs,lr_init=lr_init,lr_min=1e-4) 
-        for sample in tqdm([samples[2]], desc=f"Epoch {epoch+1}/{epochs}"):
+        lr = cosine_annealing(epoch,epochs,lr_init=lr_init,lr_min=1e-10) 
+#for sample in tqdm([samples[2]], desc=f"Epoch {epoch+1}/{epochs}"):
+        for sample in tqdm(samples, desc=f"Epoch {epoch+1}/{epochs}"):
             images=sample['images']
             geom_indices = sample['geom_indices']
             # 3. 前向
@@ -795,7 +800,7 @@ def main():
                 heatmap, reg, heatmap_gt, reg_gt,
                 depth_logits_batch, depth_gt,
                 hm_weight=hm_weight, reg_weight=reg_weight, depth_weight=depth_weight,
-                hm_alpha = alphas,hm_gamma=3.0
+                hm_alpha = alphas,hm_gamma=5.0
             )
             total_loss += losses['total_loss']
 
