@@ -11,19 +11,30 @@ from generate_heatmap import generate_inline_html,save_all_class_heatmaps
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from funcs import sigmoid
+from viz_utils import print_params_l1,save_feature_map_grid
+import shutil
+
 # ============================
 # 配置
 # ============================
 DATA_ROOT = "/Users/zhaomingming/data_sets/v1.0-mini"  # 修改为你的路径
 CAMERAS = ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT',
            'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
-BEV_RANGE = (-44, 44)          # 米
+BEV_RANGE = (-22, 22)          # 米
 BEV_RESOLUTION = 1.0           # 米/像素
 BEV_SIZE = (int((BEV_RANGE[1] - BEV_RANGE[0]) / BEV_RESOLUTION),
             int((BEV_RANGE[1] - BEV_RANGE[0]) / BEV_RESOLUTION))
 DEPTH_BINS = 41
 DEPTH_RANGE = (4.0, 45.0)      # 米
 BATCH_SIZE = 1  # 先使用单样本训练
+# 确定特征图尺寸（由模型决定）
+#H, W = 256, 704  # 输入图像尺寸（需与模型一致）
+#H, W = 512, 1408  # 输入图像尺寸（需与模型一致）
+#Hf, Wf = H // 32, W // 32  # 8, 22
+
+H, W = 128, 352  # 输入图像尺寸（需与模型一致）
+Hf, Wf = H // 4, W // 4  # 8, 22
+
 
 class_mapping = {
     'movable_object.barrier': 0,
@@ -661,7 +672,7 @@ def get_sample_from_st(sample_token,geom_indices,instance_to_category,cat_name_m
 
     # 5. 生成 GT
     #heatmap_gt = generate_heatmap_gt(anns, ego_pose_mat, BEV_SIZE, sigma=3.0)
-    heatmap_gt = generate_heatmap_gt(anns, ego_pose_mat, BEV_SIZE, class_mapping, instance_to_category, cat_name_map, sigma=3.0)
+    heatmap_gt = generate_heatmap_gt(anns, ego_pose_mat, BEV_SIZE, class_mapping, instance_to_category, cat_name_map, sigma=0.1)
     # 将heatmap_gt 显示为3D
     #generate_inline_html(heatmap_gt,output_html = 'view_heatmap_inline.html')
     reg_gt = generate_reg_gt(anns, ego_pose_mat, BEV_SIZE)
@@ -691,11 +702,13 @@ def get_samples(sts,geom_indices_cache,instance_to_category,H,W,Hf,Wf):
 # 训练主循环
 # ============================
 def main():
+    plt.ion()
     BEST_MODEL_PATH = 'best_model.npz'   # 保存在当前目录
+    SECOND_BEST_MODEL_PATH = 'second_best_model.npz'   # 保存在当前目录
     # 初始化模型参数
     model_params = init_model_params(
         backbone_in=3,
-        backbone_out=512,
+        backbone_out=256,
         depth_bins=DEPTH_BINS,
         context_channels=128,
         bev_channels=128,
@@ -705,7 +718,7 @@ def main():
 
     # 获取样本列表
     samples = load_json('v1.0-mini/sample.json')
-    sample_tokens = [s['token'] for s in samples]  # 使用前20个样本测试
+    sample_tokens = [s['token'] for s in samples[:1]]  # 使用前20个样本测试
     # 在 main() 中，获取样本列表后
     category_counts,class_counts = count_categories(sample_tokens)
     print("=== 类别统计 ===")
@@ -726,30 +739,23 @@ def main():
     instance_to_category = {inst['token']: inst['category_token'] for inst in instances}
     cat_name_map = {cat['token']: cat['name'] for cat in categories}
 
-
-
-    # 确定特征图尺寸（由模型决定）
-    H, W = 256, 704  # 输入图像尺寸（需与模型一致）
-    #H, W = 512, 1408  # 输入图像尺寸（需与模型一致）
-    Hf, Wf = H // 32, W // 32  # 8, 22
-
     # 预计算几何索引（耗时，可缓存）
     geom_indices_cache = {}
     for token in tqdm(sample_tokens, desc="Building geometry indices"):
         geom_indices_cache[token] = [build_geometry_indices(token, model_params, H, W, Hf, Wf)]
     samples = get_samples(sample_tokens,geom_indices_cache,instance_to_category,H,W,Hf,Wf)
     # 超参数
-    lr_init = 3e-4
-    epochs = 1000
-    hm_weight = 0.1*0.5
-    reg_weight =100.0*100.0*0.0
+    lr_init = 1e-04
+    epochs = 100
+    hm_weight = 1000000.0
+    reg_weight =1.0
     depth_weight =10.0*3.0*0
     # ---------- 尝试加载最佳模型 ----------
-    best_loss = float('inf')
-    start_epoch = 0
     m, v = None, None
     step = 1
-
+    start_epoch=0
+    best_loss = float('inf')
+    set_flag = False
     if os.path.exists(BEST_MODEL_PATH):
         data = np.load(BEST_MODEL_PATH, allow_pickle=True)
         model_params = data['model_params'].item()          # 恢复模型参数
@@ -757,29 +763,41 @@ def main():
         v = data['v'].item() if 'v' in data else {}
         step = int(data['step']) if 'step' in data else 1
         best_loss = float(data['best_loss'])                # 历史最佳损失
+        #best_loss = float('inf')
         start_epoch = int(data['epoch']) + 1                # 从下一轮开始
+        set_flag = data['set_flag']
         print(f"✅ 加载最佳模型 (epoch {int(data['epoch'])})，损失 {best_loss:.6f}")
     else:
         print("🆕 未找到已有模型，从头训练")
         m, v = {}, {}   # 确保后续 adam_update 能正确初始化
         step = 1
-    start_epoch = 0
-    best_loss = float('inf')
+    #start_epoch = 0
+    #best_loss = float('inf')
+    
     for epoch in range(start_epoch,epochs):
-        if epoch>100:
-            hm_weight = 0.1*0.5*0.1
+        if epoch>100 and set_flag == False:
+            seg_flag = True
+            hm_weight =1.0 
             reg_weight = 100.0*100.0
             lr_init = 9e-5
+            best_loss = float('inf')
+            BEST_MODEL_PATH = 'best_model_reg.npz'   # 保存在当前目录
+            SECOND_BEST_MODEL_PATH = 'second_best_model_reg.npz'   # 保存在当前目录
         total_loss = 0.0
         lr = cosine_annealing(epoch,epochs,lr_init=lr_init,lr_min=1e-10) 
 #for sample in tqdm([samples[2]], desc=f"Epoch {epoch+1}/{epochs}"):
         for sample in tqdm(samples, desc=f"Epoch {epoch+1}/{epochs}"):
             images=sample['images']
+            save_feature_map_grid(images,f'feature_log_dir/images_epoch_{epoch}.png',d_mean=False,title=f'images_{epoch}')
             geom_indices = sample['geom_indices']
             # 3. 前向
             heatmap, reg, depth_logits_list, bev_feat, caches = bev_forward(
                 images, geom_indices, BEV_SIZE, model_params
             )
+            save_feature_map_grid(caches['bev_acc'],f'feature_log_dir/bev_acc_epoch_{epoch}.png',d_mean=False,title=f'bev_acc_{epoch}')
+            save_feature_map_grid(caches['bev_feat'],f'feature_log_dir/bev_feat_epoch_{epoch}.png',d_mean=False,title=f'bev_feat_{epoch}')
+            save_feature_map_grid(caches['heatmap'],f'feature_log_dir/heatmap_epoch_{epoch}.png',d_mean=False,title=f'heatmap_{epoch}')
+            save_feature_map_grid(caches['reg'],f'feature_log_dir/reg_epoch_{epoch}.png',d_mean=False,title=f'reg_{epoch}')
             show_pred(heatmap,reg,depth_logits_list)
             # 5. 生成 GT
             heatmap_gt = sample['hm']
@@ -789,6 +807,8 @@ def main():
             save_all_class_heatmaps(heatmap, heatmap_gt, epoch, save_dir='bev_vis', num_cols=4)
             reg_gt = sample['reg']
             depth_gt=sample['depth']
+            save_feature_map_grid(heatmap_gt,f'feature_log_dir/heatmap_gt_epoch_{epoch}.png',d_mean=False,title=f'heatmap_gt_{epoch}')
+            save_feature_map_grid(reg_gt,f'feature_log_dir/reg_gt_epoch_{epoch}.png',d_mean=False,title=f'reg_gt_{epoch}')
 
             # 6. 堆叠深度 logits（取第一个相机，仅前摄像头）
             #depth_logits_batch = depth_logits_list[0][None, ...]  # (1, D, Hf, Wf)
@@ -800,7 +820,7 @@ def main():
                 heatmap, reg, heatmap_gt, reg_gt,
                 depth_logits_batch, depth_gt,
                 hm_weight=hm_weight, reg_weight=reg_weight, depth_weight=depth_weight,
-                hm_alpha = alphas,hm_gamma=5.0
+                hm_alpha = alphas,hm_gamma=0.0
             )
             total_loss += losses['total_loss']
 
@@ -808,7 +828,7 @@ def main():
             dheatmap, dreg, ddepth = d_compute_losses(
                 heatmap, reg, heatmap_gt, reg_gt,
                 depth_logits_batch, depth_gt, loss_caches,hm_weight=hm_weight,reg_weight = reg_weight,depth_weight=depth_weight,
-                hm_alpha = alphas,hm_gamma=2.0
+                hm_alpha = alphas,hm_gamma=0.0
             )
 
             # 9. 构建深度梯度列表（每个相机）
@@ -819,10 +839,12 @@ def main():
                 dheatmap, dreg, ddepth_per_cam,
                 caches, model_params, geom_indices, BEV_SIZE
             )
-            grads = clip_grad_norm(grads,max_norm=1.0)
+            #grads = clip_grad_norm(grads,max_norm=1.0)
 			# 假设 total_loss 是当前 epoch 的总损失（您代码中是单样本的 total_loss）
             if total_loss < best_loss:
                 best_loss = total_loss
+                if os.path.exists(BEST_MODEL_PATH):
+                    shutil.copy2(BEST_MODEL_PATH,SECOND_BEST_MODEL_PATH)
                 np.savez_compressed(
                     BEST_MODEL_PATH,
                     model_params=model_params,
@@ -831,15 +853,18 @@ def main():
                     step=step,
                     epoch=epoch,
                     lr = lr,
-                    best_loss=best_loss
+                    best_loss=best_loss,
+                    set_flag = set_flag
                 )
                 print(f"⭐ 保存最佳模型 (epoch {epoch})，损失 {best_loss:.6f}")
             # 11. 更新
             model_params, m, v, step = adam_update(model_params, grads, lr, step, m, v)
         if (epoch+1) % 1 == 0:
             print(f"Epoch {epoch:3d},lr : {lr} total: {losses['total_loss']:.6f},hm:{losses['loss_heatmap']:.6f},reg:{losses['loss_reg']:.6f},depth:{losses['loss_depth']:.6f}")
-            print(model_params['bev_encoder']['enc1']['conv1_w'][:2,:2,...].flatten())
-            print(grads['bev_encoder']['enc1']['conv1_w'][:2,:2,...].flatten())
+            #print(model_params['bev_encoder']['enc1']['conv1_w'][:2,:2,...].flatten())
+            #print(grads['bev_encoder']['enc1']['conv1_w'][:2,:2,...].flatten())
+            #print_params_l1(model_params,prefix='')
+            print_params_l1(grads,prefix='',filter_keys=('_w',))
 
 #        avg_loss = total_loss / len(sample_tokens)
 #        print(f"Epoch {epoch+1}/{epochs}, avg loss: {avg_loss:.4f}")
