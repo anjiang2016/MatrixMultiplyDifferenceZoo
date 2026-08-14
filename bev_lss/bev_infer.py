@@ -7,7 +7,7 @@ from train_nuscenes import (
     load_json, load_sample_data, get_annotations,
     generate_heatmap_gt, generate_reg_gt, generate_depth_gt,
     build_geometry_indices,
-    BEV_SIZE, DEPTH_BINS, DEPTH_RANGE, DATA_ROOT, CAMERAS, class_mapping,
+    H,W,Hf,Wf,BEV_SIZE, DEPTH_BINS, DEPTH_RANGE, DATA_ROOT, CAMERAS, class_mapping,
     init_model_params, bev_forward, bev_backward, compute_losses, d_compute_losses
 )
 from funcs import (
@@ -213,10 +213,10 @@ def main():
         print("⚠️ 未找到 best_model.npz，使用随机初始化")
         model_params = init_model_params(
             backbone_in=3,
-            backbone_out=64,
+            backbone_out=256,
             depth_bins=DEPTH_BINS,
-            context_channels=64,
-            bev_channels=64,
+            context_channels=128,
+            bev_channels=128,
             bev_shape=BEV_SIZE,
             num_classes=len(class_mapping)
         )
@@ -239,17 +239,14 @@ def main():
     # 假设您循环处理多个样本（这里以单个样本为例，但可扩展）
     sample_index = 0   # 或使用 enumerate
 
-    H, W = 256, 704
-    Hf, Wf = H // 32, W // 32
     # 循环处理每个样本
     for sample_token in tqdm(sample_tokens[:3], desc="Processing samples"):
         # 3. 构建几何索引
         geom_indices = build_geometry_indices(sample_token, model_params, H, W, Hf, Wf)
         geom_indices_batch = [ geom_indices]
         # 4. 加载图像和标定
-        img_list, calib_list, ego_pose_mat = load_sample_data(sample_token)
+        img_list, calib_list, ego_pose_mat = load_sample_data(sample_token,target_size=(H,W))
         images = np.stack([img.transpose(2,0,1) for img in img_list], axis=0)[None, ...]
-
         # 5. 前向
         heatmap, reg, depth_logits_list, bev_feat, caches = bev_forward(
             images, geom_indices_batch, BEV_SIZE, model_params
@@ -265,7 +262,7 @@ def main():
         instance_to_category = {inst['token']: inst['category_token'] for inst in instances}
         cat_name_map = {cat['token']: cat['name'] for cat in categories}
         anns = get_annotations(sample_token)
-        heatmap_gt = generate_heatmap_gt(anns, ego_pose_mat, BEV_SIZE, class_mapping, instance_to_category, cat_name_map, sigma=3.0)
+        heatmap_gt = generate_heatmap_gt(anns, ego_pose_mat, BEV_SIZE, class_mapping, instance_to_category, cat_name_map, sigma=1.0)
         reg_gt = generate_reg_gt(anns, ego_pose_mat, BEV_SIZE)
         gt_boxes = decode_heatmap(heatmap_gt, reg_gt, threshold=0.5)
         print(f"GT 目标数: {len(gt_boxes)}")
