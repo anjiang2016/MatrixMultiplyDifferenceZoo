@@ -4,7 +4,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import time
 from funcs import (
-    conv, d_conv, silu, d_silu, avgpool, d_avgpool,d_avgpool_f,
+    conv, d_conv, silu, d_silu, relu, d_relu,avgpool, d_avgpool,d_avgpool_f,
     softmax, d_softmax, sigmoid, linear, d_linear,batch_norm,d_batch_norm,
     maxpool,d_maxpool,upsample_nearest,d_upsample_nearest
 )
@@ -19,28 +19,31 @@ def resnet_stem(x, params):
     params: {'conv1_w': (64,3,7,7), 'conv1_b': (64,)}
     返回: out (B,64,H/4,W/4), cache (x, out_conv, out_relu, out_pool)
     """
-    out_conv, _, _ = conv(x, params['conv1_w'], params['conv1_b'], stride=2, padding=3)
+    out_conv, _, _ = conv(x, params['conv1_w'], params['conv1_b'], stride=1, padding=3)
     out_bn,bn_cache= batch_norm(out_conv,params['gamma'],params['beta'],training=True)
     out_relu = silu(out_bn)
-    out_pool, max_cache = maxpool(out_relu, kernel_size=3, stride=2, padding=1)
-    cache = (x, out_conv, bn_cache,out_relu, out_pool,max_cache)
-    return out_pool, cache
+    #out_pool, max_cache = maxpool(out_relu, kernel_size=3, stride=2, padding=1)
+    #cache = (x, out_conv, bn_cache,out_relu, out_pool,max_cache)
+    cache = (x, out_conv, bn_cache,out_relu )
+    return out_relu, cache
 
 def d_resnet_stem(dout, cache, params):
-    x, out_conv, bn_cache, out_relu, out_pool,max_cache = cache
+    #x, out_conv, bn_cache, out_relu, out_pool,max_cache = cache
+    x, out_conv, bn_cache, out_relu = cache
     # avgpool 反向
     t0=time.perf_counter()
-    d_pool = d_maxpool(dout, max_cache)
+    #d_pool = d_maxpool(dout, max_cache)
     #print(f" d_avgpool {time.perf_counter()-t0:.3f}s")
     # relu 反向
-    d_relu_out = d_silu(d_pool, out_relu)
+    d_relu_out = d_silu(dout, out_relu)
     # bn 反向
     dx, dgamma, dbeta = d_batch_norm(d_relu_out,bn_cache)
     # conv 反向
     t0=time.perf_counter()
-    dx, dw, db = d_conv(d_relu_out, x, params['conv1_w'], stride=2, padding=3)
+    dx, dw, db = d_conv(d_relu_out, x, params['conv1_w'], stride=1, padding=3)
     #print(f" d_conv {time.perf_counter()-t0:.3f}s")
-    grads = {'conv1_w': dw, 'conv1_b': db,'gamma':dgamma, 'beta':dbeta}
+    grads={'stem':{}}
+    grads['stem'] = {'conv1_w': dw, 'conv1_b': db,'gamma':dgamma, 'beta':dbeta}
     return dx, grads
 #Bottleneck： Conv → BN → ReLU → Conv → BN → ReLU → Conv → BN → (Add) → ReLU
 #Basic： Conv → BN → ReLU → Conv → BN → (Add) → ReLU
@@ -105,7 +108,7 @@ def resnet18_features(x, params):
     out, stem_cache = resnet_stem(x, params['stem'])
     caches['stem'] = stem_cache
     avg_caches = []
-    for stage in range(4):
+    for stage in range(2):
         stage_caches = []
         for block in range(1):
             block_params = params[f'stage{stage}']
@@ -130,7 +133,7 @@ def d_resnet18_features(dout, caches, params):
     grads = {'backbone':{}}
     avg_caches = caches['avg_caches']
     # 从后往前遍历阶段
-    for stage in range(3, -1, -1):
+    for stage in range(1, -1, -1):
         # 如果该 stage 有下采样（stage < 3），前向有 avgpool，反向需先上采样
         if stage < 3:
             avg_cache = avg_caches[stage]
@@ -151,7 +154,7 @@ def d_resnet18_features(dout, caches, params):
     t0 = time.perf_counter()
     dx_stem, stem_grads = d_resnet_stem(dx, caches['stem'], params['stem'])
     #print(f"d_resnet_stem : {time.perf_counter() - t0:.3f}s")
-    grads.update(stem_grads)
+    grads['backbone'].update(stem_grads)
     return dx_stem, grads
 
 # ============================
@@ -207,20 +210,24 @@ def bev_pool(lift_feat, geom_indices, bev_shape):
     """
     valid_mask = geom_indices >=0
     geom_indices0 = geom_indices[valid_mask]
+   
     B, D, C_ctx, H, W = lift_feat.shape
     N = D * H * W
     lift_flat = lift_feat.reshape(B, N, C_ctx)
     lift_flat0 = lift_flat[:,valid_mask,:]
     X, Y = bev_shape
+
+    if len(geom_indices) == 0:
+        return np.zeros((B,C_ctx,X,Y),dytpe=np.float32)
     bev_list = []
+    # 按网格索引排序
+    order = np.argsort(geom_indices0)
+    sorted_idx = geom_indices0[order]
+    # 获取唯一网格和每个网格的点数
+    unique_idx, counts = np.unique(sorted_idx, return_counts=True)
     for b in range(B):
         feat = lift_flat0[b]
-        # 按网格索引排序
-        order = np.argsort(geom_indices0)
         sorted_feat = feat[order]
-        sorted_idx = geom_indices0[order]
-        # 获取唯一网格和每个网格的点数
-        unique_idx, counts = np.unique(sorted_idx, return_counts=True)
         # 计算累积和（cumsum trick）
         cumsum = np.cumsum(sorted_feat, axis=0)  # (N, C)
         # 每个网格的结束索引（0-based）
@@ -261,6 +268,8 @@ def d_bev_pool(dout_bev, lift_feat, geom_indices, bev_shape):
     geom_indices0 = geom_indices[valid_mask]
     B, C_ctx, X, Y = dout_bev.shape
     B, D, C_ctx, H, W = lift_feat.shape
+    if len(geom_indices0) == 0:
+        return np.zeros((B,D,c_ctx,H,W),dtype=np.float32)
     N = D * H * W
     dout_flat = dout_bev.reshape(B, C_ctx, -1).transpose(0, 2, 1)  # (B, X*Y, C)
     d_lift_flat = np.zeros((B, N, C_ctx), dtype=np.float32)
@@ -282,7 +291,7 @@ def bev_encoder(x, params):
 
     # ---------- 编码器 ----------
     out = x   # 初始化 out
-    for stage in range(3):
+    for stage in range(2):
         stage_params = params[f'enc{stage}']   # 保留您原有的路径
         # 第一个卷积块
         caches[f'enc{stage}_conv1'] = out
@@ -310,7 +319,7 @@ def bev_encoder(x, params):
     out, c_conv,_=conv(out,bottom_params['conv_w'],bottom_params['conv_b'],stride=1,padding=3)
 
     # ---------- 解码器 ----------
-    for stage in range(2, -1, -1):
+    for stage in range(1, -1, -1):
         out, c_up = upsample_nearest(out, scale_factor=2)
         caches[f'up{stage}'] = c_up
         skip = enc_outs[stage]
@@ -351,7 +360,7 @@ def d_bev_encoder(dout, caches, params):
     # ---------- 解码器反向（从 stage=0 到 2，因为前向从 2 到 0） ----------
     skip_grads = {}   # 暂存跳跃连接梯度，用于编码器反向累加
 
-    for stage in range(3):
+    for stage in range(2):
         # 获取当前解码块的缓存
         c_conv2 = caches[f'dec{stage}_conv2']
         c_bn2 = caches[f'dec{stage}_bn2']
@@ -408,7 +417,7 @@ def d_bev_encoder(dout, caches, params):
     dx,dw_conv,db_conv = d_conv(dx,caches['bottom'],params['bottom']['conv_w'],stride=1,padding=3)
     grads['bottom']={'conv_w':dw_conv,'conv_b':db_conv}
     # ---------- 编码器反向（从 stage=2 到 0） ----------
-    for stage in range(2, -1, -1):
+    for stage in range(1, -1, -1):
         # 反传池化（对应前向的 maxpool）
         c_pool = caches[f'pool{stage}']
         dx = d_maxpool(dx, c_pool)
@@ -507,40 +516,58 @@ def d_bev_encoder_1(dout, caches, params):
 def centernet_head(bev_feat, head_params):
     """
     bev_feat: (B, C, X, Y)
-    head_params: {'heatmap_w': (num_classes, C, 3,3), 'heatmap_b': (num_classes,),
-                 'reg_w': (8, C, 3,3), 'reg_b': (8,)}
+    head_params: {'heatmap_w2': (num_classes, C, 3,3), 'heatmap_b2': (num_classes,),
+                 'reg_w2': (8, C, 3,3), 'reg_b2': (8,)}
     返回: heatmap (B, num_classes, X, Y), reg (B, 8, X, Y)
     """
-    heatmap, _, _ = conv(bev_feat, head_params['heatmap_w'], head_params['heatmap_b'], stride=1, padding=1)
-    reg, _, _ = conv(bev_feat, head_params['reg_w'], head_params['reg_b'], stride=1, padding=1)
-    return heatmap, reg
+    ch_out,_,_ = conv(bev_feat,head_params['heatmap_w1'],head_params['heatmap_b1'],stride=1,padding=1)
+    #hm_relu_out = relu(ch_out)
+	
+    heatmap, _, _ = conv(ch_out, head_params['heatmap_w2'], head_params['heatmap_b2'], stride=1, padding=0)
+    
+    cr_out,_,_ = conv(bev_feat,head_params['reg_w1'],head_params['reg_b1'],stride=1,padding=1)
+    reg_relu_out = silu(cr_out)
+    reg, _, _ = conv(reg_relu_out, head_params['reg_w2'], head_params['reg_b2'], stride=1, padding=0)
+    caches = (_,ch_out,reg_relu_out,cr_out)
+    return heatmap, reg, caches
 
-def d_centernet_head(dheatmap, dreg, reg,bev_feat, head_params):
+def d_centernet_head(dheatmap, dreg, reg,bev_feat, head_params,caches):
     """
     dheatmap: (B, num_classes, X, Y)
     dreg: (B, 8, X, Y)
     bev_feat: (B, C, X, Y)
     head_params: 参数字典
+    caches: (hm_relu_out, reg_relu_out)
     返回: dbev, grads 字典
     """
+    (hm_relu_out,ch_out,reg_relu_out,cr_out) = caches
     #dreg_conv = (1 - reg**2)*dreg 
-    dbev_hm, dw_hm, db_hm = d_conv(dheatmap, bev_feat, head_params['heatmap_w'], stride=1, padding=1)
-    dbev_reg, dw_reg, db_reg = d_conv(dreg, bev_feat, head_params['reg_w'], stride=1, padding=1)
+    d_conv2, dw2_hm, db2_hm = d_conv(dheatmap, ch_out, head_params['heatmap_w2'], stride=1, padding=0)
+    #d_hm_relu_out = d_relu(d_conv2)
+    #d_hm_relu_out = d_silu(d_conv2, ch_out)
+    dbev_hm,dw1_hm,db1_hm = d_conv(d_conv2,bev_feat,head_params['heatmap_w1'],stride=1,padding=1)
+
+    d_reg_conv, dw2_reg, db2_reg = d_conv(dreg, reg_relu_out, head_params['reg_w2'], stride=1, padding=0)
+    d_reg_relu_out = d_silu(d_reg_conv, cr_out)
+    dbev_reg, dw1_reg, db1_reg = d_conv(d_reg_relu_out, bev_feat, head_params['reg_w1'], stride=1, padding=1)
     dbev = dbev_hm + dbev_reg
     grads = {
-        'heatmap_w': dw_hm, 'heatmap_b': db_hm,
-        'reg_w': dw_reg, 'reg_b': db_reg
+        'heatmap_w1': dw1_hm, 'heatmap_b1': db1_hm,
+        'heatmap_w2': dw2_hm, 'heatmap_b2': db2_hm,
+        'reg_w1': dw1_reg, 'reg_b1': db1_reg,
+        'reg_w2': dw2_reg, 'reg_b2': db2_reg
     }
     return dbev, grads
 
 # ============================
 # 6. 损失函数及其梯度
 # ============================
-def focal_loss(heatmap_pred, heatmap_gt, alpha=0.25, gamma=0.0):
+def focal_loss(heatmap_pred, heatmap_gt, alpha=0.25, gamma=2.0):
     """
     软标签 Focal Loss，适用于 heatmap_gt 为连续值 [0,1]
     """
-    pred = sigmoid(heatmap_pred)+1e-12
+    #pred = sigmoid(heatmap_pred)+1e-12
+    pred = np.clip(sigmoid(heatmap_pred), 1e-7, 1 - 1e-7)
     #pred = np.clip(pred, 1e-7, 1 - 1e-7)
 
     pos_weight = heatmap_gt           # 正样本权重
@@ -567,7 +594,8 @@ def d_focal_loss(heatmap_pred, heatmap_gt, alpha=0.25, gamma=2.0):
     """
     软标签 Focal Loss 的梯度
     """
-    pred = sigmoid(heatmap_pred)+1e-12
+    #pred = sigmoid(heatmap_pred)+1e-12
+    pred = np.clip(sigmoid(heatmap_pred), 1e-7, 1 - 1e-7)
     #pred = np.clip(pred, 1e-7, 1 - 1e-7)
     pos_weight = heatmap_gt
     neg_weight = 1 - heatmap_gt
@@ -587,7 +615,8 @@ def d_focal_loss(heatmap_pred, heatmap_gt, alpha=0.25, gamma=2.0):
     grad_neg = -alpha_neg * pred ** gamma * (gamma * (1 - pred) * np.log(1 - pred + 1e-8) + (1 - pred) - 1)
 
     grad = grad_pos * pos_weight + grad_neg * neg_weight
-    return grad
+    N = float(heatmap_pred.size)
+    return grad/N
 def focal_loss_hard(heatmap_pred, heatmap_gt, alpha=0.25, gamma=2.0):
     """
     heatmap_pred: (B, num_classes, H, W) logits
@@ -705,11 +734,11 @@ def reg_l1_loss(reg_pred, reg_gt, heatmap_gt, beta=1.0):
 
     pos_mask_expanded = np.repeat(pos_mask[:, None, :, :], reg_pred.shape[1], axis=1)
     diff = reg_pred[pos_mask_expanded] - reg_gt[pos_mask_expanded]
-    
     # Smooth L1
     abs_diff = np.abs(diff)
-    print(abs_diff[abs_diff>1])
-    print(np.abs(abs_diff[abs_diff>1]).mean())
+    print(reg_gt[pos_mask_expanded])
+    print(reg_pred[pos_mask_expanded])
+    print(diff)
     loss = np.where(abs_diff < beta,
                     0.5 * diff**2 / beta,
                     abs_diff - 0.5 * beta)
@@ -944,9 +973,10 @@ def bev_forward(images, geom_indices_list, bev_shape, model_params):
     caches['bev_feat'] = bev_feat
 
     # 5. 检测头
-    heatmap, reg = centernet_head(bev_feat, model_params['head'])
+    heatmap, reg,c_caches = centernet_head(bev_feat, model_params['head'])
     caches['heatmap'] = heatmap
     caches['reg'] = reg
+    caches['c_caches']=c_caches
 
     return heatmap, reg, depth_logits_list, bev_feat, caches
 def merge_grads(dst, src):
@@ -989,7 +1019,8 @@ def bev_backward(dheatmap, dreg, ddepth_list, caches, model_params, geom_indices
     bev_feat = caches['bev_feat']
     head_params = model_params['head']
     reg = caches['reg']
-    dbev, head_grads = d_centernet_head(dheatmap, dreg, reg,bev_feat, head_params)
+    c_caches = caches['c_caches']
+    dbev, head_grads = d_centernet_head(dheatmap, dreg, reg,bev_feat, head_params,c_caches)
     grads['head'] = head_grads
 
     # 2. BEV 编码器反向
@@ -1114,8 +1145,9 @@ def init_model_params(backbone_in=3, backbone_out=512,
         'beta':np.zeros(64)
     }
     # stages
-    for stage in range(4):
-        C_stage = [64,64,128,256,512] 
+    for stage in range(2):
+        #C_stage = [64,64,128,256,512] 
+        C_stage = [64,128,256] 
         for block in range(1):
             C =C_stage[stage]
             Cs=C_stage[stage+1]
@@ -1133,7 +1165,7 @@ def init_model_params(backbone_in=3, backbone_out=512,
                 'gamma3':np.ones(Cs),
                 'beta3':np.zeros(Cs)
             }
-    # Lift 输入通道改为 64
+    # Lift 输入通道改为 
     params['lift_depth'] = {
         'w': init_conv_weight((depth_bins, backbone_out, 3, 3), gain=global_gain),
         'b': np.zeros(depth_bins)
@@ -1146,11 +1178,12 @@ def init_model_params(backbone_in=3, backbone_out=512,
     base_channels=  bev_channels
     C_in = context_channels
     # 编码器通道数
-    enc_channels = [base_channels, base_channels*2, base_channels*4]  # 3层
+    #enc_channels = [base_channels, base_channels*2, base_channels*4]  # 3层
+    enc_channels = [base_channels, base_channels*2]  # 2层
     # 解码器通道数（与编码器对称，但拼接后通道数加倍）
     dec_channels = [base_channels*4, base_channels*2, base_channels]   # 反向
     params['bev_encoder']={}
-    for stage in range(3):
+    for stage in range(2):
         C = enc_channels[stage]
         # 每层两个卷积，输入通道：第一层为前一层输出（第一层为 C_in），第二层为 C
         C_in_1 = C_in if stage == 0 else enc_channels[stage-1]
@@ -1170,11 +1203,11 @@ def init_model_params(backbone_in=3, backbone_out=512,
         'conv_b':np.zeros(C)
 	}
     # 解码器（通道数：上采样后与跳跃拼接，所以输入通道为 dec_C + enc_C）
-    for stage in range(2,-1,-1):
+    for stage in range(1,-1,-1):
         C = enc_channels[stage]
         # 第一个卷积输入通道：上采样后通道数 + 跳跃连接通道数
-        if stage == 2:  # 最底层，输入为编码器最底层输出通道
-            in_ch = enc_channels[2]
+        if stage == 1:  # 最底层，输入为编码器最底层输出通道
+            in_ch = enc_channels[1]
         else:
             in_ch = enc_channels[stage+1]  # 上一解码器输出通道
         # 上采样后通道数不变，拼接后变为 in_ch + enc_channels[stage]
@@ -1224,10 +1257,14 @@ def init_model_params(backbone_in=3, backbone_out=512,
     '''
     # Head
     params['head'] = {
-        'heatmap_w': init_conv_weight((num_classes, bev_channels, 3, 3), gain=1.0),
-        'heatmap_b': np.zeros(num_classes),
-        'reg_w': init_conv_weight((8, bev_channels, 3, 3), gain=1.4),
-        'reg_b': np.zeros(8)
+        'heatmap_w1': init_conv_weight((bev_channels, bev_channels, 3, 3), gain=1.0),
+        'heatmap_b1': np.zeros(bev_channels),
+        'heatmap_w2': init_conv_weight((num_classes, bev_channels, 1, 1), gain=1.0),
+        'heatmap_b2': np.zeros(num_classes),
+        'reg_w1': init_conv_weight((bev_channels, bev_channels, 3, 3), gain=1.4),
+        'reg_b1': np.zeros(bev_channels),
+        'reg_w2': init_conv_weight((8, bev_channels, 1, 1), gain=1.4),
+        'reg_b2': np.zeros(8)
     }
     return params
 def check_nan(grads, prefix=""):
@@ -1271,7 +1308,8 @@ def check_nan(grads, prefix=""):
 if __name__ == "__main__":
     # 设置参数
     bev_shape = (88,88)
-    B, N, H, W = 1, 6, 256, 704
+    #B, N, H, W = 1, 6, 256, 704
+    B, N, H, W = 1, 6, 128,352 
     depth_bins = 41
     context_channels = 64
     bev_channels = 64
